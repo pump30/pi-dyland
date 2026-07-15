@@ -1,28 +1,30 @@
 # docker-compose.yml — deploy pi-dyland on the NAS.
 #
 # Usage on the NAS:
-#   1. rsync/upload this repo to /volume1/docker/pi-dyland/
-#   2. cp .env.example .env; edit .env with real AICORE_TOKEN + SMTP/CalDAV/Vault/ZSpace creds
+#   1. Upload this repo to /pi-dyland/ on the NAS
+#   2. cp .env.example .env; edit .env with a real AICORE_TOKEN
+#      For NAS-internal use, keep AICORE_BASE_URL=http://127.0.0.1:6655
+#      (aicore-proxy publishes on host port 6655)
 #   3. docker compose up -d --build
 #
-# The agent reaches the SAP AI Core proxy via https://aicore.superdyland.uk
-# (aicore-proxy on the same NAS, published through cloudflared / your reverse proxy).
+# We use network_mode: host so the container can reach the aicore-proxy
+# container on 127.0.0.1:6655 without any docker-network wiring, and so the
+# chat UI is served on the NAS host at http://<nas-ip>:8787/.
 services:
   pi-dyland:
     build: .
     image: pi-dyland:local
     container_name: pi-dyland
     restart: unless-stopped
-    ports:
-      - "8787:8787"
+    network_mode: host
     env_file:
       - .env
     volumes:
-      # Optional: mount an additional skills directory from the host so you
-      # can add new skills without rebuilding the image.
+      # Mount host skills dir read-only so new skills can be added without
+      # rebuilding the image.
       - ./skills:/app/skills:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8787/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
       interval: 30s
       timeout: 5s
       retries: 3
