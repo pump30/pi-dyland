@@ -3,25 +3,25 @@ import type { Model } from "@earendil-works/pi-ai";
 
 // -----------------------------------------------------------------------------
 // LLM backend: SAP AI Core proxy (aicore-proxy) on my NAS, Anthropic-compatible.
-// pi-ai already ships a full `anthropic-messages` streaming implementation; we
-// only need to describe the model. pi's default provider dispatch will pick
-// the right stream function based on `model.api`.
+//
+// aicore-proxy authenticates with `Authorization: Bearer <token>`, NOT the
+// Anthropic-standard `x-api-key`. pi-ai's built-in anthropic-messages provider
+// only sends `Authorization: Bearer` when the token starts with `sk-ant-oat`
+// (Claude OAuth), otherwise it sends `x-api-key`. Our token is neither, so we
+// force the header via `Model.headers` and skip pi-ai's apiKey path entirely.
+// The provider's `assertRequestAuth` accepts a request when either `apiKey` or
+// an `authorization` header is present.
 // -----------------------------------------------------------------------------
 
 export interface AicoreModelConfig {
 	baseUrl: string;
 	modelId: string;
-	/** aicore-proxy issues an Anthropic-shaped `x-api-key`. */
+	/** aicore-proxy bearer token. Sent as `Authorization: Bearer <token>`. */
 	apiKey: string;
 }
 
 /**
  * Build a pi-ai `Model` targeting the NAS aicore-proxy.
- *
- * The context window / maxTokens numbers are conservative defaults that match
- * what aicore-proxy passes through to SAP AI Core's Claude Opus deployment. If
- * the real limits differ, we can lift them without breaking anything since
- * pi-ai clamps against them internally.
  */
 export function buildAicoreModel(config: AicoreModelConfig): Model<"anthropic-messages"> {
 	return {
@@ -35,8 +35,10 @@ export function buildAicoreModel(config: AicoreModelConfig): Model<"anthropic-me
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200_000,
 		maxTokens: 32_000,
-		// Anthropic-compatible auth: aicore-proxy expects the token as x-api-key.
-		// pi-ai passes `options.apiKey` through to the Anthropic SDK client.
+		// aicore-proxy uses bearer auth; inject the header directly.
+		headers: {
+			Authorization: `Bearer ${config.apiKey}`,
+		},
 	};
 }
 
@@ -68,9 +70,6 @@ export function createPersonalAgent(options: CreateAgentOptions): Agent {
 			model,
 			tools: options.tools,
 		},
-		// aicore-proxy authentication: forward the token as apiKey to the
-		// underlying Anthropic SDK client.
-		getApiKey: async () => options.aicore.apiKey,
 	});
 	return agent;
 }
