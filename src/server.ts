@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
+import { basicAuth } from "hono/basic-auth";
 import { streamSSE } from "hono/streaming";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -19,10 +20,20 @@ const AICORE_TOKEN = process.env.AICORE_TOKEN ?? "";
 const PORT = Number.parseInt(process.env.PORT ?? "8787", 10);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const SKILLS_PATH = (process.env.SKILLS_PATH ?? "./skills").split(":").filter(Boolean);
+const AUTH_USER = process.env.AUTH_USER ?? "";
+const AUTH_PASS = process.env.AUTH_PASS ?? "";
 
 if (!AICORE_TOKEN) {
 	console.error("[server] AICORE_TOKEN is not set. The agent cannot call the LLM backend.");
 	process.exit(1);
+}
+
+const authEnabled = Boolean(AUTH_USER && AUTH_PASS);
+if (!authEnabled) {
+	console.warn(
+		"[server] WARNING: AUTH_USER/AUTH_PASS not set. HTTP server is unauthenticated. " +
+			"Set both in .env to enable Basic Auth for everything except /health.",
+	);
 }
 
 // -----------------------------------------------------------------------------
@@ -46,6 +57,19 @@ const agent = createPersonalAgent({
 // -----------------------------------------------------------------------------
 
 const app = new Hono();
+
+// -----------------------------------------------------------------------------
+// Auth: HTTP Basic Auth for everything except /health.
+// /health stays open so Cloudflare Tunnel and container healthchecks work
+// without credentials. Set AUTH_USER + AUTH_PASS in .env to enable.
+// -----------------------------------------------------------------------------
+
+if (authEnabled) {
+	app.use("*", async (c, next) => {
+		if (c.req.path === "/health") return next();
+		return basicAuth({ username: AUTH_USER, password: AUTH_PASS })(c, next);
+	});
+}
 
 app.get("/health", (c) =>
 	c.json({
