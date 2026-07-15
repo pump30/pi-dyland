@@ -157,6 +157,76 @@ export interface LoadedSkill {
 export interface LoadSkillsOptions {
 	/** Colon-separated list of directories to scan. */
 	roots: string[];
+	/**
+	 * Optional Claude Code skill roots (e.g. `~/.claude/skills`). For each pi
+	 * skill loaded, if a same-named directory exists here (matching by kebab
+	 * or snake), its `SKILL.md` frontmatter description is APPENDED to the pi
+	 * skill's description. This lets the LLM pick the right tool using the
+	 * richer Claude Code prose, while execution stays with the pi skill's
+	 * `run.sh` (which has structured params). No SKILL.md scripts are executed.
+	 */
+	claudeSkillRoots?: string[];
+}
+
+// -----------------------------------------------------------------------------
+// SKILL.md frontmatter helper (Phase F). Very small, no YAML lib: we only
+// need `description`.
+// -----------------------------------------------------------------------------
+
+async function readSkillMdDescription(dir: string): Promise<string | null> {
+	const p = path.join(dir, "SKILL.md");
+	let raw: string;
+	try {
+		raw = await readFile(p, "utf8");
+	} catch {
+		return null;
+	}
+	if (!raw.startsWith("---")) return null;
+	const end = raw.indexOf("\n---", 3);
+	if (end < 0) return null;
+	const frontmatter = raw.slice(3, end);
+	// Find the `description:` line, then read subsequent lines until the next
+	// top-level `key:` line or end of frontmatter. Accepts single-line and
+	// wrapped values. Ignores YAML block-scalar markers.
+	const lines = frontmatter.split("\n");
+	let inDesc = false;
+	const buf: string[] = [];
+	for (const line of lines) {
+		const startMatch = line.match(/^description\s*:\s*(?:\|-?|>-?)?\s*(.*)$/);
+		if (!inDesc && startMatch) {
+			inDesc = true;
+			if (startMatch[1]) buf.push(startMatch[1]);
+			continue;
+		}
+		if (inDesc) {
+			// Continuation only if the line is indented or empty. Any other
+			// top-level `key:` ends the description.
+			if (/^[a-zA-Z_-]+\s*:/.test(line)) break;
+			buf.push(line.trim());
+		}
+	}
+	const desc = buf.join(" ").replace(/\s+/g, " ").trim();
+	return desc || null;
+}
+
+async function findClaudeSkillDir(
+	claudeRoots: string[],
+	name: string,
+): Promise<string | null> {
+	// pi skill names are snake_case; Claude Code dirs are usually kebab-case.
+	const candidates = [name, name.replace(/_/g, "-")];
+	for (const root of claudeRoots) {
+		for (const c of candidates) {
+			const dir = path.join(path.resolve(root), c);
+			try {
+				const s = await stat(dir);
+				if (s.isDirectory()) return dir;
+			} catch {
+				// keep trying
+			}
+		}
+	}
+	return null;
 }
 
 export async function loadSkills(options: LoadSkillsOptions): Promise<LoadedSkill[]> {
@@ -199,10 +269,24 @@ export async function loadSkills(options: LoadSkillsOptions): Promise<LoadedSkil
 			const parameters = manifestToParameters(manifest);
 			const timeoutMs = manifest.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 			const envAllow = new Set(manifest.env ?? []);
+			// Phase F: pull SKILL.md description from a sibling Claude Code
+			// skill directory (matched by name, snake ↔ kebab). Appended, not
+			// replaced, so the pi manifest description stays authoritative.
+			let description = manifest.description;
+			if (options.claudeSkillRoots && options.claudeSkillRoots.length > 0) {
+				const cdir = await findClaudeSkillDir(options.claudeSkillRoots, manifest.name);
+				if (cdir) {
+					const cdesc = await readSkillMdDescription(cdir);
+					if (cdesc && cdesc !== description) {
+						description = `${manifest.description}\n\nClaude Code companion notes: ${cdesc}`;
+						console.log(`[skill-loader] enriched ${manifest.name} from ${cdir}/SKILL.md`);
+					}
+				}
+			}
 			const tool: AgentTool = {
 				name: manifest.name,
 				label: manifest.label,
-				description: manifest.description,
+				description,
 				parameters,
 				execute: async (_toolCallId, params, signal): Promise<AgentToolResult<unknown>> => {
 					const childEnv: NodeJS.ProcessEnv = {
@@ -249,7 +333,7 @@ export async function loadSkills(options: LoadSkillsOptions): Promise<LoadedSkil
 					return { content: contentBlocks, details };
 				},
 			};
-			loaded.push({ manifest, dir, tool });
+			loaded.push({ manifest: { ...manifest, description }, dir, tool });
 		}
 	}
 	return loaded;
