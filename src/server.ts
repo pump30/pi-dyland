@@ -450,22 +450,33 @@ app.post("/chat", async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// Static chat UI
+// Static UI: Next.js static export lives under src/web-next/. Build via
+// `cd web-next && npm run build`, then rsync the out/ contents into
+// src/web-next/. The Dockerfile copies src/web-next/ into the image.
 // -----------------------------------------------------------------------------
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const webRoot = path.join(__dirname, "web");
+const webRoot = path.join(__dirname, "web-next");
 
 app.get("/", async (c) => {
-	const html = await readFile(path.join(webRoot, "index.html"), "utf8");
-	return c.html(html);
+	try {
+		const html = await readFile(path.join(webRoot, "index.html"), "utf8");
+		return c.html(html);
+	} catch {
+		return c.text(
+			"UI not built. Run `cd web-next && npm run build` and copy web-next/out/* into src/web-next/.",
+			500,
+		);
+	}
 });
 
+// Serve everything under src/web-next/ at the root. Next.js static export
+// emits _next/, favicon.ico, and named .html files (only / and /404 for us),
+// so we mount at "/*" and let unmatched fall through to 404.
 app.use(
-	"/web/*",
+	"/*",
 	serveStatic({
 		root: path.relative(process.cwd(), webRoot) || ".",
-		rewriteRequestPath: (p) => p.replace(/^\/web\//, "/"),
 	}),
 );
 
