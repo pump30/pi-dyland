@@ -1,16 +1,22 @@
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessageEventStream,
+	type Context,
+	type Model,
+	type SimpleStreamOptions,
+	streamSimple,
+} from "@earendil-works/pi-ai/compat";
 
 // -----------------------------------------------------------------------------
 // LLM backend: SAP AI Core proxy (aicore-proxy) on my NAS, Anthropic-compatible.
 //
 // aicore-proxy authenticates with `Authorization: Bearer <token>`, NOT the
 // Anthropic-standard `x-api-key`. pi-ai's built-in anthropic-messages provider
-// only sends `Authorization: Bearer` when the token starts with `sk-ant-oat`
-// (Claude OAuth), otherwise it sends `x-api-key`. Our token is neither, so we
-// force the header via `Model.headers` and skip pi-ai's apiKey path entirely.
-// The provider's `assertRequestAuth` accepts a request when either `apiKey` or
-// an `authorization` header is present.
+// only uses `Authorization: Bearer` when the token starts with `sk-ant-oat`
+// (Claude OAuth); otherwise it uses `x-api-key`. Our token is aicore-proxy's
+// own static bearer, so we wrap streamSimple and inject the Authorization
+// header into `options.headers`. The provider's `assertRequestAuth` accepts a
+// request when an `authorization` header is present, so no apiKey is needed.
 // -----------------------------------------------------------------------------
 
 export interface AicoreModelConfig {
@@ -35,10 +41,25 @@ export function buildAicoreModel(config: AicoreModelConfig): Model<"anthropic-me
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200_000,
 		maxTokens: 32_000,
-		// aicore-proxy uses bearer auth; inject the header directly.
-		headers: {
-			Authorization: `Bearer ${config.apiKey}`,
-		},
+	};
+}
+
+/**
+ * Wrap pi-ai's `streamSimple` to inject `Authorization: Bearer <token>` into
+ * `options.headers` before dispatch. This bypasses pi's provider-based apiKey
+ * lookup for the custom "superdyland" provider.
+ */
+export function buildAicoreStreamFn(apiKey: string) {
+	return (
+		model: Model<"anthropic-messages">,
+		context: Context,
+		options?: SimpleStreamOptions,
+	): AssistantMessageEventStream => {
+		const mergedHeaders = {
+			...(options?.headers ?? {}),
+			Authorization: `Bearer ${apiKey}`,
+		};
+		return streamSimple(model, context, { ...options, headers: mergedHeaders });
 	};
 }
 
@@ -70,6 +91,7 @@ export function createPersonalAgent(options: CreateAgentOptions): Agent {
 			model,
 			tools: options.tools,
 		},
+		streamFn: buildAicoreStreamFn(options.aicore.apiKey),
 	});
 	return agent;
 }
