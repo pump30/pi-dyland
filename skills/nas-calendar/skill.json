@@ -1,14 +1,18 @@
 {
   "name": "nas_calendar",
   "label": "NAS Calendar",
-  "description": "Add, list, or delete calendar events on the self-hosted Radicale CalDAV server. Use for personal scheduling. Requires CALDAV_URL, CALDAV_USER, CALDAV_PASS to be configured on the server.",
+  "description": "Read, add, or delete calendar events on the self-hosted Radicale CalDAV server. The user has MULTIPLE calendars (e.g. Doctor Bella, SAP OUTLOOK, F1 2026). ALWAYS specify which calendar via the 'calendar' parameter (case-insensitive substring of the display name). If unsure which calendar the user means, first call action=list_calendars, then ASK the user to pick — do NOT guess. Requires CALDAV_URL (principal URL), CALDAV_USER, CALDAV_PASS on the server.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["list", "add", "delete"],
-        "description": "Operation to perform."
+        "enum": ["list_calendars", "list", "add", "delete"],
+        "description": "list_calendars: enumerate all calendars. list: read events from one calendar (requires 'calendar'). add: create event (requires 'calendar', 'summary', 'start'). delete: remove event (requires 'calendar', 'uid')."
+      },
+      "calendar": {
+        "type": "string",
+        "description": "Case-insensitive substring of the target calendar's display name. Required for list/add/delete. Must match exactly one calendar; ambiguous or zero matches return an error listing candidates so you can ask the user."
       },
       "summary": {
         "type": "string",
@@ -20,7 +24,7 @@
       },
       "end": {
         "type": "string",
-        "description": "ISO 8601 end datetime. Required for 'add'. Defaults to start + 1h if omitted."
+        "description": "ISO 8601 end datetime. Optional for 'add'; defaults to start + 1h."
       },
       "uid": {
         "type": "string",
