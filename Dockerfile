@@ -29,7 +29,12 @@ RUN find ./skills -type f -name 'run.sh' -exec chmod +x {} +
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8787 \
-    SKILLS_PATH=/app/skills
+    SKILLS_PATH=/app/skills \
+    DATA_DIR=/data
+
+# Durable JSON state (user profile, preferences) lives here. Bind-mount a host
+# path over /data at `docker run` time so memory survives container recreation.
+VOLUME ["/data"]
 
 EXPOSE 8787
 
