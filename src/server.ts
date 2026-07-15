@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { streamSSE } from "hono/streaming";
@@ -121,10 +122,100 @@ app.post("/reset", (c) => {
 //      enough to prevent 524.
 const HEARTBEAT_MS = 15_000;
 
+// Attachment limits. Keep aligned with the UI's client-side checks so the
+// server rejects with a clear message instead of the LLM failing on oversized
+// blobs.
+const MAX_IMAGES = 6;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB decoded
+const MAX_FILES = 10;
+const MAX_FILE_BYTES = 200 * 1024; // 200 KB text
+const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+interface ChatFile {
+	name: string;
+	content: string;
+}
+
+interface ChatBody {
+	prompt?: unknown;
+	images?: unknown;
+	files?: unknown;
+}
+
+interface ValidatedAttachments {
+	images: ImageContent[];
+	files: ChatFile[];
+}
+
+function parseAttachments(body: ChatBody): ValidatedAttachments | { error: string } {
+	const images: ImageContent[] = [];
+	const files: ChatFile[] = [];
+
+	if (body.images !== undefined) {
+		if (!Array.isArray(body.images)) return { error: "images must be an array" };
+		if (body.images.length > MAX_IMAGES) return { error: `too many images (max ${MAX_IMAGES})` };
+		for (const [i, raw] of body.images.entries()) {
+			if (!raw || typeof raw !== "object") return { error: `images[${i}] must be an object` };
+			const rec = raw as { data?: unknown; mimeType?: unknown };
+			if (typeof rec.data !== "string" || typeof rec.mimeType !== "string") {
+				return { error: `images[${i}] must have { data: string, mimeType: string }` };
+			}
+			if (!ALLOWED_IMAGE_MIMES.has(rec.mimeType)) {
+				return { error: `images[${i}] mimeType ${rec.mimeType} not allowed` };
+			}
+			// base64 decoded size ~ length * 3/4
+			const approxBytes = Math.floor((rec.data.length * 3) / 4);
+			if (approxBytes > MAX_IMAGE_BYTES) {
+				return { error: `images[${i}] exceeds ${MAX_IMAGE_BYTES} bytes` };
+			}
+			images.push({ type: "image", data: rec.data, mimeType: rec.mimeType });
+		}
+	}
+
+	if (body.files !== undefined) {
+		if (!Array.isArray(body.files)) return { error: "files must be an array" };
+		if (body.files.length > MAX_FILES) return { error: `too many files (max ${MAX_FILES})` };
+		for (const [i, raw] of body.files.entries()) {
+			if (!raw || typeof raw !== "object") return { error: `files[${i}] must be an object` };
+			const rec = raw as { name?: unknown; content?: unknown };
+			if (typeof rec.name !== "string" || typeof rec.content !== "string") {
+				return { error: `files[${i}] must have { name: string, content: string }` };
+			}
+			if (Buffer.byteLength(rec.content, "utf8") > MAX_FILE_BYTES) {
+				return { error: `files[${i}] (${rec.name}) exceeds ${MAX_FILE_BYTES} bytes` };
+			}
+			// Sanitize file name: no newlines, no closing brackets to keep the wrapper unambiguous.
+			const safeName = rec.name.replace(/[\r\n<>]/g, "").slice(0, 200);
+			files.push({ name: safeName, content: rec.content });
+		}
+	}
+
+	return { images, files };
+}
+
+function buildPromptText(prompt: string, files: ChatFile[]): string {
+	if (files.length === 0) return prompt;
+	const parts: string[] = [];
+	for (const f of files) {
+		parts.push(`<file name="${f.name}">\n${f.content}\n</file>`);
+	}
+	parts.push(prompt);
+	return parts.join("\n\n");
+}
+
 app.post("/chat", async (c) => {
-	const body = (await c.req.json().catch(() => ({}))) as { prompt?: unknown };
+	const body = (await c.req.json().catch(() => ({}))) as ChatBody;
 	const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
-	if (!prompt) return c.json({ error: "prompt is required" }, 400);
+	const parsed = parseAttachments(body);
+	if ("error" in parsed) return c.json({ error: parsed.error }, 400);
+	// prompt may be empty if the user only uploaded attachments — but we still
+	// need *something* for the model to react to. Require at least one of
+	// prompt / images / files.
+	if (!prompt && parsed.images.length === 0 && parsed.files.length === 0) {
+		return c.json({ error: "prompt or attachments required" }, 400);
+	}
+	const promptText = buildPromptText(prompt || "See attached.", parsed.files);
+	const images = parsed.images;
 
 	return streamSSE(c, async (stream) => {
 		// Fire an initial comment right away so Cloudflare sees origin bytes
@@ -173,7 +264,7 @@ app.post("/chat", async (c) => {
 		});
 
 		try {
-			await agent.prompt(prompt);
+			await agent.prompt(promptText, images.length > 0 ? images : undefined);
 		} catch (err) {
 			// eslint-disable-next-line no-console
 			console.error("[chat] agent.prompt failed:", err);
