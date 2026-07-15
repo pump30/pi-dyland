@@ -8,6 +8,171 @@ const attachBtn = document.getElementById("attach");
 const fileInput = document.getElementById("file-input");
 const attachmentsEl = document.getElementById("attachments");
 const dropOverlay = document.getElementById("drop-overlay");
+const threadListEl = document.getElementById("thread-list");
+const threadNewBtn = document.getElementById("thread-new");
+const threadTitleEl = document.getElementById("thread-title");
+const sidebarEl = document.getElementById("sidebar");
+const sidebarToggle = document.getElementById("sidebar-toggle");
+
+// -----------------------------------------------------------------------------
+// Thread state
+// -----------------------------------------------------------------------------
+
+const THREAD_KEY = "pi-dyland.active-thread";
+let activeThreadId = localStorage.getItem(THREAD_KEY) || "default";
+/** @type {{id:string,title:string,createdAt:number,lastActiveAt:number,messageCount:number}[]} */
+let threadCache = [];
+
+function setActiveThread(id) {
+  activeThreadId = id;
+  localStorage.setItem(THREAD_KEY, id);
+  renderThreadList();
+  refreshTitleFromCache();
+}
+
+function refreshTitleFromCache() {
+  const t = threadCache.find((x) => x.id === activeThreadId);
+  threadTitleEl.textContent = t?.title || "pi-dyland";
+}
+
+async function fetchThreads() {
+  try {
+    const r = await fetch("/threads");
+    if (!r.ok) return;
+    threadCache = await r.json();
+    renderThreadList();
+    refreshTitleFromCache();
+  } catch (err) {
+    // silent; sidebar just won't populate
+  }
+}
+
+function renderThreadList() {
+  threadListEl.innerHTML = "";
+  for (const t of threadCache) {
+    const li = document.createElement("li");
+    if (t.id === activeThreadId) li.classList.add("active");
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = t.title || "(untitled)";
+    title.title = `${t.title} — ${t.messageCount} messages`;
+    title.addEventListener("click", () => switchThread(t.id));
+    li.appendChild(title);
+    if (t.id !== "default") {
+      const del = document.createElement("button");
+      del.className = "del";
+      del.type = "button";
+      del.textContent = "×";
+      del.title = "Delete thread";
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete "${t.title}"?`)) return;
+        await fetch(`/threads/${t.id}`, { method: "DELETE" });
+        if (activeThreadId === t.id) setActiveThread("default");
+        await fetchThreads();
+        await loadMessages();
+      });
+      li.appendChild(del);
+    }
+    threadListEl.appendChild(li);
+  }
+}
+
+async function newThread() {
+  const r = await fetch("/threads", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) return;
+  const t = await r.json();
+  await fetchThreads();
+  setActiveThread(t.id);
+  log.innerHTML = "";
+  promptEl.focus();
+  if (window.matchMedia("(max-width: 640px)").matches) sidebarEl.classList.remove("open");
+}
+
+async function switchThread(id) {
+  if (id === activeThreadId) return;
+  setActiveThread(id);
+  await loadMessages();
+  if (window.matchMedia("(max-width: 640px)").matches) sidebarEl.classList.remove("open");
+}
+
+/** Map<tool_use_id, cardHandle> — bridges paired history messages. */
+const historicalToolCards = new Map();
+
+async function loadMessages() {
+  log.innerHTML = "";
+  historicalToolCards.clear();
+  try {
+    const r = await fetch(`/messages?thread=${encodeURIComponent(activeThreadId)}`);
+    if (!r.ok) return;
+    const messages = await r.json();
+    for (const m of messages) renderStoredMessage(m);
+  } catch (err) {
+    // silent
+  }
+}
+
+function renderStoredMessage(m) {
+  // pi Agent message shape: { role, content:[{type,text|...}, ...] }
+  if (!m || !Array.isArray(m.content)) return;
+  const role = m.role;
+  if (role === "user") {
+    let text = m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    // Strip server-side system hints (see server.ts applySlashHint).
+    let skillTag = null;
+    const hintMatch = text.match(/<system_hint>[\s\S]*?The user invoked \/([a-z0-9_]+)[\s\S]*?<\/system_hint>/);
+    if (hintMatch) skillTag = hintMatch[1];
+    text = text.replace(/<system_hint>[\s\S]*?<\/system_hint>\s*/g, "").trim();
+    if (text) {
+      addUserMessage(text, [], []);
+      if (skillTag) {
+        const lastUser = log.querySelector(".msg.user:last-of-type");
+        if (lastUser && !lastUser.querySelector(".skill-chip")) {
+          const chip = document.createElement("span");
+          chip.className = "skill-chip";
+          chip.textContent = `via /${skillTag}`;
+          lastUser.querySelector(".role")?.appendChild(chip);
+        }
+      }
+    }
+  } else if (role === "assistant") {
+    const text = m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    const toolCalls = m.content.filter((c) => c.type === "tool_use");
+    if (text) {
+      const body = addMessage("assistant md-msg", "");
+      body.innerHTML = renderMarkdown(text);
+    }
+    for (const tc of toolCalls) {
+      const card = toolCard(tc.name, tc.input);
+      // Historical tool calls don't stream results; result comes from the
+      // paired role="tool" message. Store card keyed by toolCallId so
+      // renderStoredMessage("tool") can attach the result later.
+      historicalToolCards.set(tc.id, card);
+    }
+  } else if (role === "tool") {
+    // Attach result to the card created above, if we can find it.
+    const results = m.content.filter((c) => c.type === "tool_result");
+    for (const r of results) {
+      const card = historicalToolCards.get(r.toolUseId ?? r.tool_use_id);
+      const text = (Array.isArray(r.content) ? r.content : [])
+        .filter((x) => x.type === "text")
+        .map((x) => x.text)
+        .join("\n");
+      if (card) {
+        card.setResult(text, r.isError);
+        historicalToolCards.delete(r.toolUseId ?? r.tool_use_id);
+      } else if (text) {
+        // Orphan tool result — render standalone.
+        const c = toolCard("(unknown tool)", null);
+        c.setResult(text, r.isError);
+      }
+    }
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Attachment state
@@ -148,6 +313,121 @@ function el(cls, text) {
   return d;
 }
 
+// -----------------------------------------------------------------------------
+// Minimal Markdown renderer. Enough for tool outputs and assistant replies
+// (paragraphs, bold, inline code, fenced code, links, unordered lists).
+// Not a full CommonMark parser — anything unsupported stays literal.
+// -----------------------------------------------------------------------------
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function renderMarkdown(src) {
+  if (!src) return "";
+  const blocks = [];
+  let s = src.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+    const i = blocks.length;
+    blocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
+    return `\u0000CODE${i}\u0000`;
+  });
+  s = escapeHtml(s);
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const lines = s.split("\n");
+  const out = [];
+  let listOpen = false;
+  let paraBuf = [];
+  const flushPara = () => {
+    if (paraBuf.length > 0) {
+      out.push(`<p>${paraBuf.join("<br>")}</p>`);
+      paraBuf = [];
+    }
+  };
+  const closeList = () => {
+    if (listOpen) {
+      out.push("</ul>");
+      listOpen = false;
+    }
+  };
+  for (const raw of lines) {
+    if (raw.startsWith("\u0000CODE")) {
+      flushPara();
+      closeList();
+      const i = Number(raw.slice(5).replace(/\u0000$/, ""));
+      out.push(blocks[i]);
+      continue;
+    }
+    const bullet = raw.match(/^\s*[-*]\s+(.*)$/);
+    if (bullet) {
+      flushPara();
+      if (!listOpen) {
+        out.push("<ul>");
+        listOpen = true;
+      }
+      out.push(`<li>${bullet[1]}</li>`);
+      continue;
+    }
+    if (raw.trim() === "") {
+      flushPara();
+      closeList();
+      continue;
+    }
+    closeList();
+    paraBuf.push(raw);
+  }
+  flushPara();
+  closeList();
+  return out.join("");
+}
+
+// Tool card: collapsed by default, click header to expand args + result.
+function toolCard(name, args) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg tool card";
+  const hd = document.createElement("div");
+  hd.className = "hd";
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "▶";
+  const nm = document.createElement("span");
+  nm.className = "toolname";
+  nm.textContent = `⚙ ${name}`;
+  const status = document.createElement("span");
+  status.className = "status";
+  status.textContent = "running…";
+  hd.append(caret, nm, status);
+  hd.addEventListener("click", () => wrap.classList.toggle("open"));
+  wrap.appendChild(hd);
+
+  const body = document.createElement("div");
+  body.className = "body";
+  const argsKv = document.createElement("div");
+  argsKv.className = "kv";
+  argsKv.innerHTML = `<div class="k">arguments</div><pre></pre>`;
+  argsKv.querySelector("pre").textContent = JSON.stringify(args ?? {}, null, 2);
+  const resultKv = document.createElement("div");
+  resultKv.className = "kv";
+  resultKv.innerHTML = `<div class="k">result</div><pre></pre>`;
+  body.append(argsKv, resultKv);
+  wrap.appendChild(body);
+
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+
+  return {
+    element: wrap,
+    status,
+    setResult(text, isError) {
+      resultKv.querySelector("pre").textContent = text || "(no output)";
+      status.textContent = isError ? "error" : "done";
+      status.classList.toggle("err", !!isError);
+      if (isError) wrap.classList.add("open");
+    },
+  };
+}
+
 function addMessage(cls, text) {
   const wrap = el(cls);
   const role = document.createElement("div");
@@ -196,9 +476,13 @@ function addUserMessage(text, images, files) {
 // Skill list
 // -----------------------------------------------------------------------------
 
+/** @type {{name:string,label:string,description:string}[]} */
+let skillCache = [];
+
 fetch("/skills")
   .then((r) => r.json())
   .then((skills) => {
+    skillCache = skills;
     skillsMeta.textContent =
       skills.length === 0
         ? "no skills loaded"
@@ -209,16 +493,95 @@ fetch("/skills")
   });
 
 // -----------------------------------------------------------------------------
+// Slash autocomplete
+// -----------------------------------------------------------------------------
+
+const slashMenu = document.getElementById("slash-menu");
+let slashHl = 0;
+
+function slashQueryFromPrompt() {
+  const v = promptEl.value;
+  // Only fire when the prompt starts with a bare "/" (no space yet, still on the token).
+  const m = v.match(/^\/([a-z0-9_-]*)$/i);
+  return m ? m[1].toLowerCase().replace(/-/g, "_") : null;
+}
+
+function positionSlashMenu() {
+  const rect = promptEl.getBoundingClientRect();
+  slashMenu.style.left = `${rect.left}px`;
+  slashMenu.style.bottom = `${window.innerHeight - rect.top + 6}px`;
+  slashMenu.style.top = "auto";
+}
+
+function renderSlashMenu(matches) {
+  slashMenu.innerHTML = "";
+  matches.forEach((s, i) => {
+    const item = document.createElement("div");
+    item.className = `slash-item${i === slashHl ? " hl" : ""}`;
+    const n = document.createElement("div");
+    n.className = "n";
+    n.textContent = `/${s.name}`;
+    const d = document.createElement("div");
+    d.className = "d";
+    d.textContent = s.label || s.description?.slice(0, 80) || "";
+    item.appendChild(n);
+    item.appendChild(d);
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      acceptSlash(s.name);
+    });
+    slashMenu.appendChild(item);
+  });
+}
+
+function acceptSlash(name) {
+  promptEl.value = `/${name} `;
+  closeSlashMenu();
+  promptEl.focus();
+}
+
+function closeSlashMenu() {
+  slashMenu.classList.remove("open");
+  slashHl = 0;
+}
+
+function refreshSlashMenu() {
+  const q = slashQueryFromPrompt();
+  if (q === null || skillCache.length === 0) {
+    closeSlashMenu();
+    return;
+  }
+  const matches = skillCache.filter((s) => s.name.startsWith(q));
+  if (matches.length === 0) {
+    closeSlashMenu();
+    return;
+  }
+  if (slashHl >= matches.length) slashHl = 0;
+  positionSlashMenu();
+  renderSlashMenu(matches);
+  slashMenu.classList.add("open");
+}
+
+promptEl.addEventListener("input", refreshSlashMenu);
+promptEl.addEventListener("blur", () => setTimeout(closeSlashMenu, 120));
+window.addEventListener("resize", () => {
+  if (slashMenu.classList.contains("open")) positionSlashMenu();
+});
+
+// -----------------------------------------------------------------------------
 // Controls
 // -----------------------------------------------------------------------------
 
 resetBtn.addEventListener("click", async () => {
-  await fetch("/reset", { method: "POST" });
+  await fetch(`/reset?thread=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
   log.innerHTML = "";
   pendingImages.length = 0;
   pendingFiles.length = 0;
   renderAttachments();
 });
+
+threadNewBtn.addEventListener("click", newThread);
+sidebarToggle?.addEventListener("click", () => sidebarEl.classList.toggle("open"));
 
 attachBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", async () => {
@@ -232,6 +595,39 @@ form.addEventListener("submit", async (event) => {
 });
 
 promptEl.addEventListener("keydown", (event) => {
+  // Slash menu navigation takes precedence when open.
+  if (slashMenu.classList.contains("open")) {
+    const items = slashMenu.querySelectorAll(".slash-item");
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      slashHl = Math.min(items.length - 1, slashHl + 1);
+      refreshSlashMenu();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      slashHl = Math.max(0, slashHl - 1);
+      refreshSlashMenu();
+      return;
+    }
+    if (event.key === "Enter" || event.key === "Tab") {
+      const q = slashQueryFromPrompt();
+      if (q !== null) {
+        const matches = skillCache.filter((s) => s.name.startsWith(q));
+        const picked = matches[slashHl];
+        if (picked) {
+          event.preventDefault();
+          acceptSlash(picked.name);
+          return;
+        }
+      }
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeSlashMenu();
+      return;
+    }
+  }
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
     form.requestSubmit();
@@ -296,8 +692,9 @@ async function send() {
   addUserMessage(prompt, sentImages, sentFiles);
   let assistantBody = null;
   let assistantText = "";
+  const toolCards = new Map(); // toolCallId -> card handle
   try {
-    const body = { prompt };
+    const body = { prompt, threadId: activeThreadId };
     if (sentImages.length > 0) {
       body.images = sentImages.map((i) => ({ data: i.data, mimeType: i.mimeType }));
     }
@@ -344,37 +741,62 @@ async function send() {
   } finally {
     sendBtn.disabled = false;
     promptEl.focus();
+    // Server may have auto-derived a title from the first prompt; refresh list.
+    fetchThreads();
   }
 
   function handleEvent(ev) {
     switch (ev.type) {
       case "assistant_start":
         assistantText = "";
-        assistantBody = addMessage("assistant", "");
+        assistantBody = addMessage("assistant md-msg", "");
         break;
       case "text_delta":
         if (!assistantBody) {
           assistantText = "";
-          assistantBody = addMessage("assistant", "");
+          assistantBody = addMessage("assistant md-msg", "");
         }
         assistantText += ev.delta;
-        assistantBody.textContent = assistantText;
+        // Render as Markdown on every delta. For tiny messages this is fine;
+        // for very large outputs consider debouncing. Current turns average
+        // <2KB, so unnecessary.
+        assistantBody.innerHTML = renderMarkdown(assistantText);
         log.scrollTop = log.scrollHeight;
         break;
       case "thinking_delta":
         break;
       case "tool_start": {
-        const body = addMessage("tool", "");
-        body.textContent = `→ ${ev.name}(${JSON.stringify(ev.args ?? {})})`;
+        const card = toolCard(ev.name, ev.args);
+        if (ev.toolCallId) toolCards.set(ev.toolCallId, card);
         break;
       }
       case "tool_end": {
-        const body = addMessage("tool", "");
         const text = (ev.result?.content ?? [])
           .filter((c) => c.type === "text")
           .map((c) => c.text)
           .join("\n");
-        body.textContent = `← ${ev.name} → ${text || "(no output)"}`;
+        const isErr = Boolean(ev.result?.isError);
+        const card = ev.toolCallId ? toolCards.get(ev.toolCallId) : null;
+        if (card) {
+          card.setResult(text, isErr);
+          toolCards.delete(ev.toolCallId);
+        } else {
+          // No matching start — render a standalone card.
+          const c = toolCard(ev.name, null);
+          c.setResult(text, isErr);
+        }
+        break;
+      }
+      case "skill_hint": {
+        // Server acknowledged a /skill-name trigger. Tag the most recent user
+        // message so the user sees which skill was hinted.
+        const lastUser = log.querySelector(".msg.user:last-of-type");
+        if (lastUser && !lastUser.querySelector(".skill-chip")) {
+          const chip = document.createElement("span");
+          chip.className = "skill-chip";
+          chip.textContent = `via /${ev.name}`;
+          lastUser.querySelector(".role")?.appendChild(chip);
+        }
         break;
       }
       case "error":
@@ -388,3 +810,6 @@ async function send() {
 }
 
 promptEl.focus();
+
+// Initial load: populate sidebar + restore active thread history.
+fetchThreads().then(() => loadMessages());
