@@ -58,6 +58,18 @@ const agent = createPersonalAgent({
 
 const app = new Hono();
 
+// Simple request log so slow / failing requests leave a trace.
+app.use("*", async (c, next) => {
+	const started = Date.now();
+	try {
+		await next();
+	} finally {
+		const elapsed = Date.now() - started;
+		// eslint-disable-next-line no-console
+		console.log(`[req] ${c.req.method} ${c.req.path} -> ${c.res.status} ${elapsed}ms`);
+	}
+});
+
 // -----------------------------------------------------------------------------
 // Auth: HTTP Basic Auth for everything except /health.
 // /health stays open so Cloudflare Tunnel and container healthchecks work
@@ -99,12 +111,30 @@ app.post("/reset", (c) => {
 
 // POST /chat  { prompt: string }
 // Streams SSE events consumed by the browser UI.
+//
+// Cloudflare edge has a 100-second timeout for the first response byte.
+// LLM cold-start via aicore-proxy can exceed that (SAP AI Core cold, retries,
+// throttling). To keep the connection alive we:
+//   1. Emit a `:` SSE comment immediately when the handler starts.
+//   2. Emit a `:heartbeat` comment every HEARTBEAT_MS while waiting for the
+//      first real event. Cloudflare treats any byte as activity, so this is
+//      enough to prevent 524.
+const HEARTBEAT_MS = 15_000;
+
 app.post("/chat", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { prompt?: unknown };
 	const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
 	if (!prompt) return c.json({ error: "prompt is required" }, 400);
 
 	return streamSSE(c, async (stream) => {
+		// Fire an initial comment right away so Cloudflare sees origin bytes
+		// before it starts the 100s countdown.
+		await stream.write(": ready\n\n").catch(() => {});
+
+		const heartbeat = setInterval(() => {
+			stream.write(`: heartbeat ${Date.now()}\n\n`).catch(() => {});
+		}, HEARTBEAT_MS);
+
 		const send = async (data: Record<string, unknown>) => {
 			await stream.writeSSE({ data: JSON.stringify(data) });
 		};
@@ -145,8 +175,11 @@ app.post("/chat", async (c) => {
 		try {
 			await agent.prompt(prompt);
 		} catch (err) {
+			// eslint-disable-next-line no-console
+			console.error("[chat] agent.prompt failed:", err);
 			await send({ type: "error", message: err instanceof Error ? err.message : String(err) });
 		} finally {
+			clearInterval(heartbeat);
 			unsubscribe();
 		}
 	});
