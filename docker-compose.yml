@@ -1,0 +1,28 @@
+# docker-compose.yml — deploy pi-dyland on the NAS.
+#
+# Usage on the NAS:
+#   1. rsync/upload this repo to /volume1/docker/pi-dyland/
+#   2. cp .env.example .env; edit .env with real AICORE_TOKEN + SMTP/CalDAV/Vault/ZSpace creds
+#   3. docker compose up -d --build
+#
+# The agent reaches the SAP AI Core proxy via https://aicore.superdyland.uk
+# (aicore-proxy on the same NAS, published through cloudflared / your reverse proxy).
+services:
+  pi-dyland:
+    build: .
+    image: pi-dyland:local
+    container_name: pi-dyland
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    volumes:
+      # Optional: mount an additional skills directory from the host so you
+      # can add new skills without rebuilding the image.
+      - ./skills:/app/skills:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

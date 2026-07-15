@@ -1,0 +1,29 @@
+{
+  "name": "pi-dyland",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Personal agent (pi-agent-core) with skill-based tools, served over HTTP + chat UI, LLM backend routed to the SAP AI Core proxy on my NAS.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node --experimental-strip-types --no-warnings src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.7",
+    "@earendil-works/pi-ai": "0.80.7",
+    "@hono/node-server": "1.19.7",
+    "hono": "4.11.6",
+    "typebox": "0.35.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

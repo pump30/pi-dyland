@@ -1,0 +1,23 @@
+{
+  "name": "zspace_nas",
+  "label": "ZSpace NAS",
+  "description": "Query and manage the ZSpace (极空间) NAS: list files, get system status, or check Docker containers. Requires ZSPACE_URL and ZSPACE_TOKEN on the server.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["list", "status", "docker_ps"],
+        "description": "Operation to perform."
+      },
+      "path": {
+        "type": "string",
+        "description": "Directory path for 'list'. Defaults to '/'."
+      }
+    },
+    "required": ["action"]
+  },
+  "entry": "run.sh",
+  "env": ["ZSPACE_URL", "ZSPACE_TOKEN"],
+  "timeoutMs": 15000
+}
