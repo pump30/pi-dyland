@@ -135,11 +135,15 @@ Existing routes are the complete API. Do **not** add REST-y CRUD or "future-proo
 
 | Route | Method | Contract |
 |---|---|---|
-| `/health` | GET | Public. Returns `{ok, aicore:{baseUrl, model}, skills:[{name,label}]}`. Never require auth. Never add PII. |
+| `/health` | GET | Public. Returns `{ok, aicore:{baseUrl, model}, skills:[{name,label}], threads}`. Never require auth. Never add PII. |
 | `/skills` | GET | Auth. Returns manifest array (name, label, description, parameters). Read-only. |
-| `/messages` | GET | Auth. Full transcript from the singleton agent. Read-only. |
-| `/reset` | POST | Auth. Calls `agent.reset()`. No body. Idempotent. |
-| `/chat` | POST | Auth. Body: `{prompt?, images?, files?}`. Response: SSE. |
+| `/threads` | GET | Auth. Returns `[{id, title, createdAt, lastActiveAt, messageCount}]` sorted by `lastActiveAt` desc. |
+| `/threads` | POST | Auth. Body `{title?}`. Creates a new thread (UUID id), returns the entry. |
+| `/threads/:id` | PATCH | Auth. Body `{title?}`. Renames. 404 if unknown. |
+| `/threads/:id` | DELETE | Auth. Deletes non-default thread; returns 400 for `default`. |
+| `/messages` | GET | Auth. Full transcript of the thread selected via `?thread=<id>` or `X-Thread-Id` header. Defaults to `default`. Read-only. |
+| `/reset` | POST | Auth. Calls `agent.reset()` on the selected thread. No body. Idempotent. |
+| `/chat` | POST | Auth. Body: `{prompt?, images?, files?, threadId?}` (threadId defaults to `default`, also honors `?thread=`/`X-Thread-Id`). Response: SSE. Server may auto-derive the thread title from the first user prompt. |
 | `/` | GET | Auth. Serves `src/web/index.html`. |
 | `/web/*` | GET | Auth. Static file server rooted at `src/web/`. |
 
@@ -159,7 +163,8 @@ Rules:
 
 ## 7. Agent & LLM rules (`src/agent-factory.ts`)
 
-- The agent is a **singleton per process**. `server.ts` builds one at startup and never rebuilds it. Do not per-request or per-session-key the agent unless multi-user is explicitly requested.
+- The agent is **per-thread**. `server.ts` maintains `Map<threadId, Agent>` (bounded by `MAX_THREADS=50`, LRU-evicted; `default` thread is never evicted). Legacy single-thread callers (old UI, curl without `?thread=`) implicitly use the `default` thread. Do NOT per-request the agent — a thread's agent lives for the lifetime of the thread. Model config, tools, and system prompt are shared across all threads.
+- Thread IDs must match `^[a-zA-Z0-9_-]{1,64}$` or the literal `default`; invalid IDs are silently rewritten to `default` in `threadIdFrom()`. This is the boundary check for URL/header input.
 - Model configuration is fixed to `api: "anthropic-messages"`, `provider: "superdyland"`, `baseUrl` from `AICORE_BASE_URL`. `contextWindow: 200_000`, `maxTokens: 32_000`. Do not lower.
 - **Bearer auth quirk (critical):** aicore-proxy uses `Authorization: Bearer <token>`, not `x-api-key`. pi-ai only auto-sends bearer when the token starts with `sk-ant-oat`. Our token is `sk-aicore-proxy-key` (aicore-proxy's own), so `buildAicoreStreamFn` wraps pi-ai's `streamSimple` and merges `Authorization` into `options.headers`. **Do not "clean up" this wrapper by moving auth to `Model.headers` — pi-ai's `assertRequestAuth` only inspects `options.headers`.**
 - `getApiKey` on `Agent` is not used; auth is header-injected via the wrapper. Do not reintroduce.
@@ -205,18 +210,23 @@ Forbidden in skills:
 
 Do **not** port arbitrary Claude Code SKILL.md skills wholesale. Each port requires a fresh `skill.json` + `run.sh` that captures the behaviour with structured args.
 
+**Description enrichment from Claude Code SKILL.md (Phase F):** if `CLAUDE_SKILLS_PATH` env is set (colon-separated), `skill-loader` looks for a same-named directory (snake ↔ kebab) and appends the SKILL.md frontmatter `description` to the pi skill's description under a "Claude Code companion notes:" line. This helps the LLM disambiguate tools using the richer Claude Code prose. **No SKILL.md scripts are executed**; the pi `skill.json + run.sh` remains the sole execution contract.
+
 **Current skill inventory (do not remove without confirmation):**
 - `nas-calendar` → tool `nas_calendar` (CalDAV via Radicale)
 - `send-email` → tool `send_email` (Gmail SMTPS)
 - `vault-lookup` → tool `vault_lookup` (kept as env-gated stub; never populate `VAULTWARDEN_TOKEN` in NAS `.env` — Vaultwarden master password never leaves the owner's Mac)
+- `web-search` → tool `web_search` (Tavily HTTP API; requires `TAVILY_API_KEY`)
 
 ---
 
 ## 9. Data & state rules
 
-- **No database.** No sqlite, no redis, no filesystem persistence for chat history.
-- The agent's `state.messages` is in-memory only. Loss on container restart is by design. Do not add persistence unless requested.
-- No global mutable singletons besides the `agent` instance in `server.ts`.
+- **No database.** No sqlite, no redis, no filesystem persistence for chat message history.
+- The agent's `state.messages` is in-memory only. Loss on container restart is by design.
+- **JSON files under `$DATA_DIR` are permitted** for durable long-term memory only: `profile.json` (LLM-written via the built-in `remember` tool) and `preferences.json` (user-written). Managed by `src/memory.ts`. Reads at startup, writes atomically via temp+rename. Do **not** extend this to store chat transcripts, session state, or arbitrary logs.
+- `$DATA_DIR` defaults to `./data` locally; on NAS it must be bind-mounted from the host (`/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data` → `/data`) so memory survives `docker rm -f`.
+- No global mutable singletons besides the thread `Map` and the memory-module `state` in `server.ts` / `memory.ts`.
 - No shared module-level caches. If caching is needed inside a skill, put it inside the skill's process (it dies with the subprocess).
 - Env vars are read **once** at module load. Do not re-read `process.env` per request. **Reminder:** because Docker `--env-file` is captured at `docker run` time, changing `.env` requires `docker rm -f pi-dyland && docker run ...`. `docker restart` will NOT re-read.
 
