@@ -55,6 +55,17 @@ export async function resetThread(id: string): Promise<void> {
   });
 }
 
+/**
+ * Cancel any in-flight prompt for a thread. Safe no-op if nothing is running.
+ * The server rebuilds the Agent so subsequent /chat cannot inherit stuck state.
+ */
+export async function cancelThread(id: string): Promise<void> {
+  await fetch(apiUrl(`/threads/${encodeURIComponent(id)}/cancel`), {
+    method: "POST",
+    credentials: "include",
+  });
+}
+
 export async function fetchMessages(threadId: string): Promise<unknown[]> {
   const r = await fetch(
     apiUrl(`/messages?thread=${encodeURIComponent(threadId)}`),

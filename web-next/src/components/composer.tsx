@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Paperclip, Send, X } from "lucide-react";
+import { Paperclip, Send, Square, X } from "lucide-react";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { cn } from "@/lib/utils";
@@ -48,16 +48,21 @@ function readAsDataUrl(file: File): Promise<string> {
 export function Composer({
   skills,
   disabled,
+  sending,
   onSend,
+  onStop,
   onError,
 }: {
   skills: Skill[];
   disabled: boolean;
+  /** True while a /chat SSE stream is in flight. Send button becomes Stop. */
+  sending: boolean;
   onSend: (
     prompt: string,
     images: AttachmentImage[],
     files: AttachmentFile[],
   ) => void;
+  onStop: () => void;
   onError: (msg: string) => void;
 }) {
   const [value, setValue] = useState("");
@@ -290,15 +295,27 @@ export function Composer({
               }
             }}
           />
-          <Button
-            size="icon"
-            className="h-8 w-8 shrink-0"
-            disabled={disabled || (!value.trim() && images.length === 0 && files.length === 0)}
-            onClick={submit}
-            title="Send (Cmd/Ctrl+Enter)"
-          >
-            <Send className="h-4 w-4" />
-          </Button>
+          {sending ? (
+            <Button
+              size="icon"
+              variant="destructive"
+              className="h-8 w-8 shrink-0"
+              onClick={onStop}
+              title="Stop (aborts the current turn)"
+            >
+              <Square className="h-3.5 w-3.5" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              disabled={disabled || (!value.trim() && images.length === 0 && files.length === 0)}
+              onClick={submit}
+              title="Send (Cmd/Ctrl+Enter)"
+            >
+              <Send className="h-4 w-4" />
+            </Button>
+          )}
         </div>
       </div>
     </div>

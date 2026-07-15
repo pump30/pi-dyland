@@ -30,6 +30,7 @@ export function ChatApp() {
   const [sending, setSending] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const sendingThreadRef = useRef<string | null>(null);
 
   // Load active-thread pointer once on mount.
   useEffect(() => {
@@ -86,6 +87,8 @@ export function ChatApp() {
   }, [messages]);
 
   async function handleNew() {
+    // If we're mid-stream, abandon it before switching threads.
+    stopStreamLocal();
     try {
       const t = await api.createThread();
       await refreshThreads();
@@ -97,6 +100,9 @@ export function ChatApp() {
   }
 
   async function handleDelete(id: string) {
+    // Cancel first — the server rebuilds the agent so the delete cannot race
+    // an in-flight prompt.
+    try { await api.cancelThread(id); } catch { /* ignore */ }
     try {
       await api.deleteThread(id);
       if (activeId === id) setActiveId(DEFAULT_THREAD_ID);
@@ -106,11 +112,72 @@ export function ChatApp() {
     }
   }
 
+  /**
+   * Hard reset the current thread. Server rebuilds the Agent instance so any
+   * stuck "already processing" state is gone — this is the escape hatch when
+   * the previous run jammed.
+   */
   async function handleReset() {
-    await api.resetThread(activeId);
+    stopStreamLocal();
+    try { await api.resetThread(activeId); } catch { /* ignore */ }
     setMessages([]);
     await refreshThreads();
   }
+
+  /**
+   * User pressed Stop while a stream was running. Abort locally AND tell the
+   * server to drop the Agent instance, otherwise pi-agent-core keeps running
+   * in the background and blocks the next prompt with "already processing".
+   */
+  function handleStop() {
+    const tid = sendingThreadRef.current;
+    stopStreamLocal();
+    if (tid) {
+      api.cancelThread(tid).catch(() => {});
+    }
+  }
+
+  function stopStreamLocal() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+  }
+
+  // If the tab is closed or reloaded mid-stream, tell the server to drop the
+  // agent instance. Uses navigator.sendBeacon so it survives unload.
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      const tid = sendingThreadRef.current;
+      if (!tid) return;
+      const url = (
+        typeof window !== "undefined" && window.location.port === "3000"
+          ? (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8787")
+          : ""
+      ) + `/threads/${encodeURIComponent(tid)}/cancel`;
+      try {
+        navigator.sendBeacon(url);
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
+  // Auto-cancel when switching to a different thread mid-stream.
+  const prevActiveRef = useRef(activeId);
+  useEffect(() => {
+    if (prevActiveRef.current !== activeId) {
+      const prev = prevActiveRef.current;
+      if (sendingThreadRef.current === prev) {
+        // We were streaming on the previous thread; drop it.
+        stopStreamLocal();
+        api.cancelThread(prev).catch(() => {});
+      }
+      prevActiveRef.current = activeId;
+    }
+  }, [activeId]);
 
   function pushError(msg: string) {
     setMessages((cur) => [
@@ -126,6 +193,8 @@ export function ChatApp() {
   ) {
     if (sending) return;
     setSending(true);
+    const targetThreadId = activeId;
+    sendingThreadRef.current = targetThreadId;
     const userId = `u-${Date.now()}`;
     // Optimistically show the user message.
     setMessages((cur) => [
@@ -150,7 +219,7 @@ export function ChatApp() {
       await api.streamChat(
         {
           prompt,
-          threadId: activeId,
+          threadId: targetThreadId,
           images: images.length > 0 ? images.map((i) => ({ data: i.data, mimeType: i.mimeType })) : undefined,
           files: files.length > 0 ? files.map((f) => ({ name: f.name, content: f.content })) : undefined,
         },
@@ -166,10 +235,16 @@ export function ChatApp() {
         abort.signal,
       );
     } catch (e) {
-      if ((e as Error).name !== "AbortError") pushError((e as Error).message);
+      const err = e as Error;
+      if (err.name === "AbortError") {
+        pushError("Cancelled");
+      } else {
+        pushError(err.message);
+      }
     } finally {
       setSending(false);
       abortRef.current = null;
+      sendingThreadRef.current = null;
       refreshThreads();
     }
   }
@@ -211,8 +286,10 @@ export function ChatApp() {
         <div className="pt-3">
           <Composer
             skills={skills}
-            disabled={sending}
+            disabled={false}
+            sending={sending}
             onSend={handleSend}
+            onStop={handleStop}
             onError={pushError}
           />
         </div>

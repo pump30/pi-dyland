@@ -4,6 +4,8 @@ export interface Thread {
   createdAt: number;
   lastActiveAt: number;
   messageCount: number;
+  /** true while a /chat SSE stream is running for this thread */
+  inFlight?: boolean;
 }
 
 export interface Skill {
