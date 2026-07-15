@@ -65,6 +65,13 @@ interface ThreadEntry {
 	agent: Agent;
 	createdAt: number;
 	lastActiveAt: number;
+	/**
+	 * True while an agent.prompt() call is running for this thread. Used to
+	 * reject overlapping /chat requests (pi-agent-core would throw "already
+	 * processing" anyway; we surface a cleaner error and let the client offer
+	 * a Stop/Cancel path).
+	 */
+	inFlight: boolean;
 }
 
 const threads = new Map<string, ThreadEntry>();
@@ -74,6 +81,26 @@ function newAgent(): Agent {
 		aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
 		tools: skills.map((s) => s.tool),
 	});
+}
+
+/**
+ * Replace a thread's Agent with a fresh instance and drop the old one.
+ *
+ * pi-agent-core does not expose a public "abort in-flight prompt" API. Once
+ * `agent.prompt()` has been called, the only way to guarantee the thread can
+ * accept a new prompt is to walk away from the old Agent entirely. The old
+ * instance's promise continues to run to completion in the background (and
+ * its outputs are discarded because we already unsubscribed), which is
+ * memory-wasteful but bounded and safe.
+ *
+ * This mirrors DeerFlow's philosophy: rather than fixing a jammed run, delete
+ * the thread state and start fresh. Here we keep the thread identity and just
+ * swap the Agent underneath so the client's threadId stays valid.
+ */
+function rebuildAgent(entry: ThreadEntry): void {
+	entry.agent = newAgent();
+	entry.inFlight = false;
+	entry.lastActiveAt = Date.now();
 }
 
 function evictOldestIfFull(): void {
@@ -103,6 +130,7 @@ function getOrCreateThread(threadId: string, titleHint?: string): ThreadEntry {
 			agent: newAgent(),
 			createdAt: Date.now(),
 			lastActiveAt: Date.now(),
+			inFlight: false,
 		};
 		threads.set(threadId, entry);
 	} else {
@@ -188,6 +216,7 @@ app.get("/threads", (c) => {
 			createdAt: t.createdAt,
 			lastActiveAt: t.lastActiveAt,
 			messageCount: t.agent.state.messages.length,
+			inFlight: t.inFlight,
 		}))
 		.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
 	return c.json(list);
@@ -229,8 +258,30 @@ app.get("/messages", (c) => {
 app.post("/reset", (c) => {
 	const id = threadIdFrom(c);
 	const entry = threads.get(id);
-	if (entry) entry.agent.reset();
-	return c.json({ ok: true });
+	if (!entry) return c.json({ ok: true, action: "noop" });
+	// Rebuild the Agent unconditionally. If a prompt was in flight, this is
+	// the only way to guarantee the thread accepts new prompts — pi-agent-core
+	// has no public abort API. If no prompt was running, this is equivalent to
+	// agent.reset() but also clears any subscription bookkeeping.
+	rebuildAgent(entry);
+	return c.json({ ok: true, action: "rebuilt" });
+});
+
+/**
+ * POST /threads/:id/cancel
+ *
+ * DeerFlow-equivalent of the LangGraph `runs/{run_id}/cancel` endpoint.
+ * pi-agent-core cannot interrupt an in-flight prompt, so we walk away from
+ * the Agent instance and hand the thread a fresh one. The client should also
+ * abort its SSE fetch so the /chat handler's `finally` unsubscribes.
+ */
+app.post("/threads/:id/cancel", (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ ok: true, action: "noop" });
+	const wasInFlight = entry.inFlight;
+	rebuildAgent(entry);
+	return c.json({ ok: true, action: "rebuilt", wasInFlight });
 });
 
 // POST /chat  { prompt: string }
@@ -376,7 +427,24 @@ app.post("/chat", async (c) => {
 		threadId = threadIdFrom(c);
 	}
 	const entry = getOrCreateThread(threadId);
+	// Reject concurrent prompts on the same thread. The client should either
+	// wait for the current stream to finish or call /threads/:id/cancel first.
+	// pi-agent-core would also throw "already processing" internally; catching
+	// it here means we don't waste a subscription bind.
+	if (entry.inFlight) {
+		return c.json(
+			{
+				error: "thread busy",
+				message:
+					"Another prompt is still streaming on this thread. Wait for it to finish or POST /threads/" +
+					threadId +
+					"/cancel to abort.",
+			},
+			409,
+		);
+	}
 	const agent = entry.agent;
+	entry.inFlight = true;
 	// Auto-derive title from first user prompt if still the default.
 	if ((entry.title === "New chat" || entry.title === "Default") && prompt) {
 		entry.title = prompt.slice(0, 40).replace(/\s+/g, " ").trim();
@@ -445,6 +513,11 @@ app.post("/chat", async (c) => {
 		} finally {
 			clearInterval(heartbeat);
 			unsubscribe();
+			// Only clear inFlight if this stream still owns the current Agent.
+			// If /threads/:id/cancel or /reset rebuilt the Agent while we were
+			// running, entry.agent now points to a fresh instance and its
+			// inFlight was already reset by rebuildAgent().
+			if (entry.agent === agent) entry.inFlight = false;
 		}
 	});
 });
