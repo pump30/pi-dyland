@@ -1,0 +1,26 @@
+{
+  "name": "send_email",
+  "label": "Send Email",
+  "description": "Send an email via SMTP. Use for notifications, reminders, forwarding info to yourself or others. Requires SMTP_HOST/USER/PASS to be configured on the server.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "to": {
+        "type": "string",
+        "description": "Recipient email address. If omitted, falls back to SMTP_USER (self)."
+      },
+      "subject": {
+        "type": "string",
+        "description": "Email subject line."
+      },
+      "body": {
+        "type": "string",
+        "description": "Plain-text email body."
+      }
+    },
+    "required": ["subject", "body"]
+  },
+  "entry": "run.sh",
+  "env": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"],
+  "timeoutMs": 20000
+}

@@ -1,0 +1,9 @@
+# Ignore heavy or sensitive files when building the Docker image context.
+node_modules
+dist
+.env
+.env.local
+.git
+.github
+*.log
+.DS_Store

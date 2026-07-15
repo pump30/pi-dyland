@@ -1,0 +1,18 @@
+{
+  "name": "vault_lookup",
+  "label": "Vault Lookup",
+  "description": "Look up a credential (username/password/note) from the self-hosted Vaultwarden server by query string. Returns the matching entry as text. Requires VAULTWARDEN_URL and VAULTWARDEN_TOKEN to be configured on the server.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query: item name, URL, or username fragment."
+      }
+    },
+    "required": ["query"]
+  },
+  "entry": "run.sh",
+  "env": ["VAULTWARDEN_URL", "VAULTWARDEN_TOKEN"],
+  "timeoutMs": 15000
+}
