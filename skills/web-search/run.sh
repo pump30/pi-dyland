@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Smoke test #2 marker — verifies autodeploy no-op path for run.sh-only changes.
 : "${TAVILY_API_KEY:?TAVILY_API_KEY not set on server (add to .env)}"
 
 INPUT="$(cat)"

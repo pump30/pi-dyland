@@ -2,6 +2,8 @@
 
 Personal agent built on [`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi-mono), served over HTTP with a minimal chat UI. LLM calls are routed to the SAP AI Core proxy (`aicore-proxy`) running on my NAS at `https://aicore.superdyland.uk` (Anthropic-compatible Messages API).
 
+<!-- smoke-test-8 marker: README-only changes should trigger autodeploy no-op. -->
+
 ## Layout
 
 ```
