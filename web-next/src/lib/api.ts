@@ -2,6 +2,7 @@ import { apiUrl } from "./utils";
 import type {
   AttachmentFile,
   AttachmentImage,
+  SessionGoal,
   Skill,
   SseEvent,
   Thread,
@@ -74,6 +75,69 @@ export async function fetchMessages(threadId: string): Promise<unknown[]> {
   if (!r.ok) return [];
   return r.json();
 }
+
+/**
+ * Compact old messages in a thread. Replaces everything but the tail with an
+ * LLM-produced summary. Returns quickly (server does one non-streaming call).
+ */
+export async function compactThread(id: string): Promise<{ ok: boolean; action?: string; dropped?: number }> {
+  const r = await fetch(apiUrl(`/compact?thread=${encodeURIComponent(id)}`), {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!r.ok) throw new Error(`POST /compact → ${r.status}`);
+  return r.json();
+}
+
+/** Fetch up to 3 follow-up prompt suggestions for the current thread. */
+export async function fetchSuggestions(id: string): Promise<string[]> {
+  try {
+    const r = await fetch(apiUrl(`/suggest?thread=${encodeURIComponent(id)}`), {
+      credentials: "include",
+    });
+    if (!r.ok) return [];
+    const data = (await r.json()) as { suggestions?: string[] };
+    return data.suggestions ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function setGoal(id: string, text: string): Promise<SessionGoal | null> {
+  const r = await fetch(apiUrl(`/threads/${encodeURIComponent(id)}/goal`), {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!r.ok) throw new Error(`PUT /threads/${id}/goal → ${r.status}`);
+  const data = (await r.json()) as { goal: SessionGoal | null };
+  return data.goal;
+}
+
+export async function clearGoal(id: string): Promise<void> {
+  await fetch(apiUrl(`/threads/${encodeURIComponent(id)}/goal`), {
+    method: "DELETE",
+    credentials: "include",
+  });
+}
+
+export interface FeedbackBody {
+  threadId: string;
+  messageId: string;
+  rating: "up" | "down";
+  note?: string;
+}
+
+export async function sendFeedback(body: FeedbackBody): Promise<void> {
+  await fetch(apiUrl("/feedback"), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
 
 export interface ChatRequestBody {
   prompt: string;
