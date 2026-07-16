@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RotateCcw } from "lucide-react";
+import { Menu, RotateCcw } from "lucide-react";
 import * as api from "@/lib/api";
 import { convertRawMessages } from "@/lib/convert-messages";
 import type {
@@ -28,6 +28,7 @@ export function ChatApp() {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const sendingThreadRef = useRef<string | null>(null);
@@ -250,16 +251,27 @@ export function ChatApp() {
   }
 
   return (
-    <div className="flex h-full">
+    <div className="relative flex h-full">
       <ThreadSidebar
         threads={threads}
         activeId={activeId}
+        open={sidebarOpen}
         onSelect={setActiveId}
         onNew={handleNew}
         onDelete={handleDelete}
+        onClose={() => setSidebarOpen(false)}
       />
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-3 px-6 py-3">
+        <header className="flex items-center gap-2 px-3 py-3 md:px-6">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 shrink-0 md:hidden"
+            onClick={() => setSidebarOpen(true)}
+            title="Threads"
+          >
+            <Menu className="h-4 w-4" />
+          </Button>
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-semibold">{activeTitle}</div>
             <div className="truncate text-xs text-muted-foreground">
@@ -270,11 +282,11 @@ export function ChatApp() {
           <Button
             variant="ghost"
             size="sm"
-            className="h-8 gap-1.5"
+            className="h-8 shrink-0 gap-1.5 px-2 md:px-3"
             onClick={handleReset}
           >
             <RotateCcw className="h-3.5 w-3.5" />
-            Reset
+            <span className="hidden sm:inline">Reset</span>
           </Button>
         </header>
         <Separator />
