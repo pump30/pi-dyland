@@ -6,6 +6,16 @@ export interface Thread {
   messageCount: number;
   /** true while a /chat SSE stream is running for this thread */
   inFlight?: boolean;
+  /** Cumulative token estimate (client-side heuristic, not authoritative). */
+  tokens?: { input: number; output: number };
+  /** Active session goal, if any. */
+  goal?: SessionGoal | null;
+}
+
+export interface SessionGoal {
+  text: string;
+  createdAt: number;
+  continuations: number;
 }
 
 export interface Skill {
@@ -42,6 +52,8 @@ export type ChatMessage =
       id: string;
       kind: "assistant";
       text: string;
+      /** Chain-of-thought / reasoning stream. Rendered in a collapsed panel. */
+      thinking?: string;
       /** true while streaming; false once done. */
       streaming?: boolean;
     }
@@ -82,5 +94,13 @@ export type SseEvent =
       };
     }
   | { type: "skill_hint"; name: string }
+  | {
+      type: "usage";
+      deltaInput: number;
+      deltaOutput: number;
+      totalInput: number;
+      totalOutput: number;
+    }
+  | { type: "goal_updated"; goal: SessionGoal | null }
   | { type: "error"; message: string }
   | { type: "done" };

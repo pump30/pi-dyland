@@ -6,11 +6,11 @@ import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { streamSSE } from "hono/streaming";
-import { readFile } from "node:fs/promises";
+import { appendFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createPersonalAgent } from "./agent-factory.ts";
+import { createPersonalAgent, oneShotCompletion } from "./agent-factory.ts";
 import { loadSkills } from "./skill-loader.ts";
 import { initMemory } from "./memory.ts";
 
@@ -28,6 +28,15 @@ const CLAUDE_SKILLS_PATH = (process.env.CLAUDE_SKILLS_PATH ?? "").split(":").fil
 const AUTH_USER = process.env.AUTH_USER ?? "";
 const AUTH_PASS = process.env.AUTH_PASS ?? "";
 const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
+// Progressive skill loading: when enabled, only skill names + labels are
+// baked into the base system prompt. Full per-skill descriptions are injected
+// on-demand via `/skill_name` slash hints. Useful once the skill inventory
+// grows past a handful; keep off by default so autonomous tool use still works
+// for the current 4-skill setup.
+const PROGRESSIVE_SKILLS = /^(1|true|yes)$/i.test(process.env.SKILLS_PROGRESSIVE ?? "");
+// Cap on goal-driven auto-continuations per thread (DeerFlow's is 8; we're a
+// single-user helper so 5 is plenty and keeps runaway loops cheap).
+const GOAL_MAX_CONTINUATIONS = 5;
 
 if (!AICORE_TOKEN) {
 	console.error("[server] AICORE_TOKEN is not set. The agent cannot call the LLM backend.");
@@ -72,14 +81,35 @@ interface ThreadEntry {
 	 * a Stop/Cancel path).
 	 */
 	inFlight: boolean;
+	/**
+	 * Approx cumulative token usage for the thread. We estimate from prompt
+	 * text length (÷4) so we don't have to reach into pi-ai's usage plumbing.
+	 * Client uses this to know when to `/compact` or start a new thread.
+	 */
+	tokens: { input: number; output: number };
+	/** Optional session goal set via `/goal <text>` or PUT /threads/:id/goal. */
+	goal: {
+		text: string;
+		createdAt: number;
+		continuations: number;
+	} | null;
 }
 
 const threads = new Map<string, ThreadEntry>();
 
 function newAgent(): Agent {
+	const toolInputs = PROGRESSIVE_SKILLS
+		? skills.map((s) => ({
+			...s.tool,
+			// Trim to label only so the base prompt cost stays flat when the
+			// skill list grows. Full description is re-injected per-turn by
+			// applySlashHint for /skill_name invocations.
+			description: s.manifest.label || s.manifest.name,
+		}))
+		: skills.map((s) => s.tool);
 	return createPersonalAgent({
 		aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
-		tools: skills.map((s) => s.tool),
+		tools: toolInputs,
 	});
 }
 
@@ -101,6 +131,14 @@ function rebuildAgent(entry: ThreadEntry): void {
 	entry.agent = newAgent();
 	entry.inFlight = false;
 	entry.lastActiveAt = Date.now();
+	// A rebuild is either a cancel (drop the stuck run) or a full reset. In
+	// both cases we clear the token accumulator — the message history is gone
+	// so the counter would just be stale.
+	entry.tokens = { input: 0, output: 0 };
+	// Reset continuation counter but keep the goal itself; if the user hit
+	// Reset because a run got stuck, they still want the goal to apply to
+	// the next attempt.
+	if (entry.goal) entry.goal.continuations = 0;
 }
 
 function evictOldestIfFull(): void {
@@ -131,6 +169,8 @@ function getOrCreateThread(threadId: string, titleHint?: string): ThreadEntry {
 			createdAt: Date.now(),
 			lastActiveAt: Date.now(),
 			inFlight: false,
+			tokens: { input: 0, output: 0 },
+			goal: null,
 		};
 		threads.set(threadId, entry);
 	} else {
@@ -217,6 +257,8 @@ app.get("/threads", (c) => {
 			lastActiveAt: t.lastActiveAt,
 			messageCount: t.agent.state.messages.length,
 			inFlight: t.inFlight,
+			tokens: t.tokens,
+			goal: t.goal,
 		}))
 		.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
 	return c.json(list);
@@ -398,9 +440,265 @@ function applySlashHint(prompt: string): { prompt: string; skill: string | null 
 	const skill = skills.find((s) => s.manifest.name === raw);
 	if (!skill) return { prompt, skill: null };
 	const rest = (m[3] ?? "").trim();
-	const hint = `${SYSTEM_HINT_OPEN}The user invoked /${skill.manifest.name}. Prefer the "${skill.manifest.name}" tool for this turn unless it clearly does not apply.${SYSTEM_HINT_CLOSE}`;
+	// Include the full description when progressive skill loading is on, so
+	// the LLM sees the tool's usage guidance even though the base prompt only
+	// listed the label. When progressive is off, the description is already
+	// in the tool definition — but repeating it costs almost nothing and
+	// still nudges tool selection.
+	const desc = skill.manifest.description
+		? `\nTool usage guidance: ${skill.manifest.description}`
+		: "";
+	const hint = `${SYSTEM_HINT_OPEN}The user invoked /${skill.manifest.name}. Prefer the "${skill.manifest.name}" tool for this turn unless it clearly does not apply.${desc}${SYSTEM_HINT_CLOSE}`;
 	const body = rest || `Ask me for the parameters the ${skill.manifest.name} tool needs.`;
 	return { prompt: `${hint}\n\n${body}`, skill: skill.manifest.name };
+}
+
+// -----------------------------------------------------------------------------
+// /compact — summarize old messages and swap them out for a summary block.
+//
+// pi-agent-core's Agent state is mutable; we drop everything up to the last
+// N messages, then push a synthetic user+assistant pair that carries the
+// LLM-produced summary. Nothing else in the pipeline (subscribe, prompt) is
+// aware of this — from the model's perspective the conversation starts with
+// a compact recap and continues normally.
+//
+// Idempotent: if the thread has fewer than KEEP_TAIL messages, no-op.
+// -----------------------------------------------------------------------------
+
+const COMPACT_KEEP_TAIL = 4;
+
+interface RawMessageForCompact {
+	role: string;
+	content: Array<{ type: string; text?: string }>;
+}
+
+function stringifyMessagesForSummary(messages: RawMessageForCompact[]): string {
+	// Cheap textual serialization. We only include role + text blocks so the
+	// summary model doesn't have to reason about tool-use JSON shapes.
+	return messages
+		.map((m) => {
+			if (!Array.isArray(m.content)) return "";
+			const text = m.content
+				.filter((c) => c.type === "text" && typeof c.text === "string")
+				.map((c) => c.text)
+				.join("\n");
+			if (!text.trim()) return "";
+			return `${m.role.toUpperCase()}: ${text}`;
+		})
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+app.post("/compact", async (c) => {
+	const id = threadIdFrom(c);
+	const entry = threads.get(id);
+	if (!entry) return c.json({ ok: false, error: "unknown thread" }, 404);
+	if (entry.inFlight) return c.json({ ok: false, error: "thread busy" }, 409);
+	const msgs = entry.agent.state.messages as unknown as RawMessageForCompact[];
+	if (msgs.length <= COMPACT_KEEP_TAIL) {
+		return c.json({ ok: true, action: "noop", kept: msgs.length });
+	}
+	const head = msgs.slice(0, msgs.length - COMPACT_KEEP_TAIL);
+	const tail = msgs.slice(msgs.length - COMPACT_KEEP_TAIL);
+	const transcript = stringifyMessagesForSummary(head);
+	if (!transcript) return c.json({ ok: true, action: "noop", reason: "no summarizable text" });
+	let summary: string;
+	try {
+		summary = await oneShotCompletion({
+			aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
+			system:
+				"You are a summarizer. Produce a compact recap of the given conversation for a personal assistant. Preserve concrete facts (dates, names, decisions, open questions), drop chit-chat and repeated context. Reply in the same language as the transcript. Under 300 words.",
+			prompt: transcript,
+			maxTokens: 800,
+		});
+	} catch (err) {
+		console.error("[compact] summarization failed:", err);
+		return c.json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 500);
+	}
+	// Rewrite messages: synthetic user (context marker) → synthetic assistant
+	// (the summary) → preserved tail.
+	const rewritten: RawMessageForCompact[] = [
+		{
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: `${SYSTEM_HINT_OPEN}Earlier conversation compacted for context.${SYSTEM_HINT_CLOSE}`,
+				},
+			],
+		},
+		{
+			role: "assistant",
+			content: [{ type: "text", text: `Prior context summary:\n\n${summary}` }],
+		},
+		...tail,
+	];
+	entry.agent.state.messages = rewritten as never;
+	// Reset the running token estimate since we just discarded most of the
+	// history. The tail is small — reseed with a rough cost of the summary.
+	entry.tokens = {
+		input: Math.ceil(summary.length / 4),
+		output: 0,
+	};
+	entry.lastActiveAt = Date.now();
+	return c.json({
+		ok: true,
+		action: "compacted",
+		dropped: head.length,
+		kept: tail.length,
+		summaryPreview: summary.slice(0, 200),
+	});
+});
+
+// -----------------------------------------------------------------------------
+// /suggest — end-of-turn follow-up suggestions.
+// Returns 3 short prompts the user might send next. Fire-and-forget from the
+// client, non-streaming, one-shot LLM call.
+// -----------------------------------------------------------------------------
+
+app.get("/suggest", async (c) => {
+	const id = threadIdFrom(c);
+	const entry = threads.get(id);
+	if (!entry) return c.json({ suggestions: [] });
+	const msgs = entry.agent.state.messages as unknown as RawMessageForCompact[];
+	if (msgs.length === 0) return c.json({ suggestions: [] });
+	// Only look at the tail — the summary model does not need the full log.
+	const tail = msgs.slice(-6);
+	const transcript = stringifyMessagesForSummary(tail);
+	if (!transcript) return c.json({ suggestions: [] });
+	let raw: string;
+	try {
+		raw = await oneShotCompletion({
+			aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
+			system:
+				"You suggest the next user turn for a personal-assistant conversation. Read the transcript and reply with exactly 3 short follow-up prompts (each under 12 words), one per line, no numbering, no quotes, no explanation. Reply in the same language as the last user turn.",
+			prompt: transcript,
+			maxTokens: 200,
+		});
+	} catch (err) {
+		console.error("[suggest] failed:", err);
+		return c.json({ suggestions: [] });
+	}
+	const suggestions = raw
+		.split(/\r?\n/)
+		.map((line) => line.replace(/^[\-\*\d.\s]+/, "").trim())
+		.filter((line) => line.length > 0 && line.length < 200)
+		.slice(0, 3);
+	return c.json({ suggestions });
+});
+
+// -----------------------------------------------------------------------------
+// /threads/:id/goal — set/clear a session goal.
+// The goal is injected as a hidden <system_hint> into every subsequent /chat
+// prompt for this thread. It also enables a lightweight continuation loop
+// (see /chat's post-run evaluator).
+// -----------------------------------------------------------------------------
+
+app.get("/threads/:id/goal", (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ goal: null });
+	return c.json({ goal: entry.goal });
+});
+
+app.put("/threads/:id/goal", async (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ error: "not found" }, 404);
+	const body = (await c.req.json().catch(() => ({}))) as { text?: unknown };
+	if (typeof body.text !== "string") return c.json({ error: "text required" }, 400);
+	const text = body.text.trim().slice(0, 500);
+	if (!text) {
+		entry.goal = null;
+		return c.json({ goal: null });
+	}
+	entry.goal = { text, createdAt: Date.now(), continuations: 0 };
+	return c.json({ goal: entry.goal });
+});
+
+app.delete("/threads/:id/goal", (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ ok: true });
+	entry.goal = null;
+	return c.json({ ok: true });
+});
+
+// -----------------------------------------------------------------------------
+// /feedback — thumbs up/down on a specific assistant turn.
+// Appended to $DATA_DIR/feedback.jsonl for later offline analysis. Never
+// touches the agent state; purely observational.
+// -----------------------------------------------------------------------------
+
+interface FeedbackBody {
+	threadId?: unknown;
+	messageId?: unknown;
+	rating?: unknown; // "up" | "down"
+	note?: unknown;
+}
+
+app.post("/feedback", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) as FeedbackBody;
+	const threadId = typeof body.threadId === "string" ? body.threadId.slice(0, 64) : "";
+	const messageId = typeof body.messageId === "string" ? body.messageId.slice(0, 128) : "";
+	const rating = body.rating === "up" || body.rating === "down" ? body.rating : null;
+	const note = typeof body.note === "string" ? body.note.slice(0, 500) : "";
+	if (!rating) return c.json({ error: "rating must be 'up' or 'down'" }, 400);
+	const record = { ts: Date.now(), threadId, messageId, rating, note };
+	try {
+		const target = path.join(DATA_DIR, "feedback.jsonl");
+		await appendFile(target, JSON.stringify(record) + "\n", "utf8");
+	} catch (err) {
+		console.error("[feedback] write failed:", err);
+		return c.json({ ok: false, error: "write failed" }, 500);
+	}
+	return c.json({ ok: true });
+});
+
+// -----------------------------------------------------------------------------
+// Goal continuation evaluator. Called after each agent.prompt turn while a
+// goal is active. Returns "continue" if the run should auto-continue, "stop"
+// otherwise. Any error -> "stop" (evaluated by the caller via .catch()).
+// -----------------------------------------------------------------------------
+
+async function evaluateGoalContinuation(
+	entry: ThreadEntry,
+	agent: Agent,
+): Promise<{ action: "continue" | "stop"; reason: string }> {
+	if (!entry.goal) return { action: "stop", reason: "no goal" };
+	const msgs = entry.agent.state.messages as unknown as RawMessageForCompact[];
+	// Peek at the last assistant message. If it ends with a question, the
+	// agent is waiting on the user — don't auto-continue.
+	const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+	if (!lastAssistant) return { action: "stop", reason: "no assistant reply yet" };
+	const lastText = (lastAssistant.content ?? [])
+		.filter((c) => c.type === "text" && typeof c.text === "string")
+		.map((c) => c.text)
+		.join("\n")
+		.trim();
+	if (!lastText) return { action: "stop", reason: "empty assistant reply" };
+	// Fast local heuristic: obvious question at the end means "waiting on user".
+	// Covers Chinese/English/whitespace variants; keeps the LLM call rate low.
+	if (/[?？]\s*$/.test(lastText)) return { action: "stop", reason: "assistant asked a question" };
+	// LLM evaluator. Kept short to stay cheap; the categories mirror
+	// DeerFlow's Session-Goals evaluator.
+	const tail = msgs.slice(-4);
+	const transcript = stringifyMessagesForSummary(tail);
+	let raw: string;
+	try {
+		raw = await oneShotCompletion({
+			aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
+			system:
+				`You judge whether an assistant should continue working toward a session goal or stop. Reply with exactly one word from: continue, stop. Reply "continue" only when the goal is NOT yet met AND the assistant is NOT waiting on the user AND the last turn did not fail. Otherwise reply "stop". Session goal: ${entry.goal.text}`,
+			prompt: transcript,
+			maxTokens: 8,
+		});
+	} catch {
+		return { action: "stop", reason: "evaluator error" };
+	}
+	const verdict = raw.trim().toLowerCase().split(/\s+/)[0] ?? "stop";
+	if (verdict.startsWith("continue")) return { action: "continue", reason: "evaluator continue" };
+	return { action: "stop", reason: `evaluator ${verdict}` };
 }
 
 app.post("/chat", async (c) => {
@@ -450,9 +748,46 @@ app.post("/chat", async (c) => {
 		entry.title = prompt.slice(0, 40).replace(/\s+/g, " ").trim();
 	}
 	const slashResult = applySlashHint(prompt);
+	// Handle `/goal <text>` and `/compact` as inline commands. `/goal` is
+	// stateful and doesn't call the LLM here; `/compact` is a redirect hint
+	// (the client should call POST /compact instead, but we short-circuit
+	// gracefully if it landed here anyway).
+	const goalCmd = prompt.match(/^\/goal(?:\s+([\s\S]*))?$/);
+	if (goalCmd) {
+		const goalText = (goalCmd[1] ?? "").trim();
+		if (goalText.toLowerCase() === "clear" || goalText.toLowerCase() === "off" || !goalText) {
+			entry.goal = null;
+		} else {
+			entry.goal = { text: goalText.slice(0, 500), createdAt: Date.now(), continuations: 0 };
+		}
+		entry.inFlight = false;
+		return streamSSE(c, async (stream) => {
+			await stream.write(": ready\n\n").catch(() => {});
+			await stream.writeSSE({
+				data: JSON.stringify({
+					type: "goal_updated",
+					goal: entry.goal,
+				}),
+			});
+			await stream.writeSSE({ data: JSON.stringify({ type: "done" }) });
+		});
+	}
 	const effectivePrompt = slashResult.prompt || prompt || "See attached.";
-	const promptText = buildPromptText(effectivePrompt, parsed.files);
+	// Inject the session goal (if any) as a hidden system_hint so the LLM
+	// stays anchored across turns without polluting the visible transcript.
+	// The convert-messages client strips <system_hint> before rendering.
+	const goalHint = entry.goal
+		? `${SYSTEM_HINT_OPEN}Session goal (active): ${entry.goal.text}${SYSTEM_HINT_CLOSE}\n\n`
+		: "";
+	const promptText = goalHint + buildPromptText(effectivePrompt, parsed.files);
 	const images = parsed.images;
+	// Rough token estimate for input: 4 chars ≈ 1 token. Cheap and good
+	// enough for a "when should I compact?" indicator — precise usage would
+	// require reaching into pi-ai's provider response, which we intentionally
+	// keep out of scope (see CLAUDE.md §7).
+	const inputEst = Math.ceil(promptText.length / 4);
+	entry.tokens.input += inputEst;
+	let outputChars = 0;
 
 	return streamSSE(c, async (stream) => {
 		// Fire an initial comment right away so Cloudflare sees origin bytes
@@ -481,6 +816,7 @@ app.post("/chat", async (c) => {
 				case "message_update": {
 					const inner = event.assistantMessageEvent;
 					if (inner.type === "text_delta") {
+						outputChars += inner.delta.length;
 						await send({ type: "text_delta", delta: inner.delta });
 					} else if (inner.type === "thinking_delta") {
 						await send({ type: "thinking_delta", delta: inner.delta });
@@ -498,19 +834,55 @@ app.post("/chat", async (c) => {
 						result: event.result,
 					});
 					break;
-				case "agent_end":
-					await send({ type: "done" });
-					break;
+				// Note: agent_end is intentionally NOT forwarded. We may fire
+				// a second agent.prompt for goal continuation, and we only
+				// want the client to see one `done` at the very end. Final
+				// usage/done are emitted in the outer finally-adjacent block.
 			}
 		});
 
 		try {
 			await agent.prompt(promptText, images.length > 0 ? images : undefined);
+			// Goal-driven continuation loop. After each successful prompt, ask
+			// a small evaluator whether the session goal is met. If not (and
+			// the assistant isn't waiting on the user), fire another prompt
+			// with a hidden continue directive. Capped at GOAL_MAX_CONTINUATIONS
+			// per goal to prevent runaway loops. This is DeerFlow's Session
+			// Goals pattern applied to a single-agent setup.
+			while (
+				entry.goal &&
+				entry.agent === agent &&
+				entry.goal.continuations < GOAL_MAX_CONTINUATIONS
+			) {
+				const verdict = await evaluateGoalContinuation(entry, agent).catch(() => null);
+				if (!verdict || verdict.action !== "continue") break;
+				entry.goal.continuations += 1;
+				const contHint = `${SYSTEM_HINT_OPEN}Continue working toward the session goal: ${entry.goal.text}. Take the next concrete step. If you are blocked and need user input, stop and ask; otherwise keep going.${SYSTEM_HINT_CLOSE}`;
+				await agent.prompt(contHint);
+			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
 			console.error("[chat] agent.prompt failed:", err);
 			await send({ type: "error", message: err instanceof Error ? err.message : String(err) });
 		} finally {
+			// Emit final usage + done AFTER any continuation runs so the
+			// client sees one clean end-of-turn signal for the whole burst.
+			const outputEst = Math.ceil(outputChars / 4);
+			// outputChars was accumulated inside the subscriber; entry.tokens.output
+			// was NOT bumped in the subscriber anymore, so bump it here.
+			entry.tokens.output += outputEst;
+			try {
+				await send({
+					type: "usage",
+					deltaInput: inputEst,
+					deltaOutput: outputEst,
+					totalInput: entry.tokens.input,
+					totalOutput: entry.tokens.output,
+				});
+				await send({ type: "done" });
+			} catch {
+				/* stream may already be closed */
+			}
 			clearInterval(heartbeat);
 			unsubscribe();
 			// Only clear inFlight if this stream still owns the current Agent.

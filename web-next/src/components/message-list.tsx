@@ -5,18 +5,27 @@ import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/lib/types";
 import { MarkdownBody } from "./markdown";
 import { ToolCard } from "./tool-card";
+import { ReasoningPanel } from "./reasoning-panel";
+import { FeedbackButtons } from "./feedback-buttons";
 
-export function MessageList({ messages }: { messages: ChatMessage[] }) {
+export function MessageList({
+  messages,
+  threadId,
+}: {
+  messages: ChatMessage[];
+  /** Passed down so per-message feedback can attribute the vote. */
+  threadId: string;
+}) {
   return (
     <div className="flex flex-col gap-3 py-6">
       {messages.map((m) => (
-        <MessageRow key={m.id} msg={m} />
+        <MessageRow key={m.id} msg={m} threadId={threadId} />
       ))}
     </div>
   );
 }
 
-function MessageRow({ msg }: { msg: ChatMessage }) {
+function MessageRow({ msg, threadId }: { msg: ChatMessage; threadId: string }) {
   if (msg.kind === "tool") return <ToolCard msg={msg} />;
 
   if (msg.kind === "error") {
@@ -69,6 +78,9 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
             <div className="whitespace-pre-wrap break-words text-sm">{msg.text}</div>
           ) : (
             <>
+              {msg.thinking && (
+                <ReasoningPanel text={msg.thinking} streaming={msg.streaming} />
+              )}
               <MarkdownBody text={msg.text} />
               {msg.streaming && msg.text === "" && (
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -76,6 +88,11 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-muted-foreground [animation-delay:150ms]" />
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-muted-foreground [animation-delay:300ms]" />
                 </div>
+              )}
+              {/* Feedback appears only after streaming completes, and only
+                  when there is actual assistant text to rate. */}
+              {!msg.streaming && msg.text && (
+                <FeedbackButtons threadId={threadId} messageId={msg.id} />
               )}
             </>
           )}

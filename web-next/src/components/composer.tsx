@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Paperclip, Send, Square, X } from "lucide-react";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
+import { VoiceInput } from "./voice-input";
+import { firstPlaceholderRange } from "./suggestions";
 import { cn } from "@/lib/utils";
 import type {
   AttachmentFile,
@@ -45,14 +47,16 @@ function readAsDataUrl(file: File): Promise<string> {
   });
 }
 
-export function Composer({
-  skills,
-  disabled,
-  sending,
-  onSend,
-  onStop,
-  onError,
-}: {
+export interface ComposerHandle {
+  /**
+   * Overwrite the current draft. When `highlightPlaceholder` is true and the
+   * text contains a `[placeholder]` block, we select it so the user can start
+   * typing immediately.
+   */
+  setDraft: (text: string, highlightPlaceholder?: boolean) => void;
+}
+
+export const Composer = forwardRef<ComposerHandle, {
   skills: Skill[];
   disabled: boolean;
   /** True while a /chat SSE stream is in flight. Send button becomes Stop. */
@@ -64,13 +68,41 @@ export function Composer({
   ) => void;
   onStop: () => void;
   onError: (msg: string) => void;
-}) {
+}>(function Composer({
+  skills,
+  disabled,
+  sending,
+  onSend,
+  onStop,
+  onError,
+}, ref) {
   const [value, setValue] = useState("");
   const [images, setImages] = useState<AttachmentImage[]>([]);
   const [files, setFiles] = useState<AttachmentFile[]>([]);
   const [slashHl, setSlashHl] = useState(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    setDraft(text, highlightPlaceholder) {
+      setValue(text);
+      requestAnimationFrame(() => {
+        const ta = taRef.current;
+        if (!ta) return;
+        ta.focus();
+        // Grow the textarea to fit.
+        ta.style.height = "auto";
+        ta.style.height = Math.min(200, ta.scrollHeight) + "px";
+        if (highlightPlaceholder) {
+          const range = firstPlaceholderRange(text);
+          if (range) ta.setSelectionRange(range.start, range.end);
+          else ta.setSelectionRange(text.length, text.length);
+        } else {
+          ta.setSelectionRange(text.length, text.length);
+        }
+      });
+    },
+  }));
 
   // Slash-autocomplete: only when the whole prompt starts with a bare /token
   const slashMatch = value.match(/^\/([a-z0-9_-]*)$/i);
@@ -235,10 +267,24 @@ export function Composer({
               e.target.value = "";
             }}
           />
+          <VoiceInput
+            disabled={disabled || sending}
+            onTranscript={(text) => {
+              setValue((v) => (v ? v + " " + text : text));
+              // Grow the textarea to fit the incoming transcript.
+              requestAnimationFrame(() => {
+                const ta = taRef.current;
+                if (!ta) return;
+                ta.style.height = "auto";
+                ta.style.height = Math.min(200, ta.scrollHeight) + "px";
+                ta.focus();
+              });
+            }}
+          />
           <Textarea
             ref={taRef}
             value={value}
-            placeholder="Say something to Dyland… (Cmd/Ctrl+Enter to send, / for skills)"
+            placeholder="Say something to Dyland… (⌘K menu, / for skills, /goal for a session goal)"
             className="min-h-[38px] flex-1 border-0 bg-transparent px-1 py-1.5 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
             rows={1}
             onChange={(e) => {
@@ -320,4 +366,5 @@ export function Composer({
       </div>
     </div>
   );
-}
+});
+Composer.displayName = "Composer";
