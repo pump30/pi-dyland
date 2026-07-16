@@ -5,5 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=15869560895
+# UID 1004 = user 15869560895. Cannot use the username directly because
+# systemd's NSS lookup treats fully-numeric names as numeric UIDs, and
+# 15869560895 overflows uid_t. Verified on NAS: `id 15869560895` returns
+# uid=1004. If you migrate the NAS user, update this line.
+User=1004
 ExecStart=/tmp/zfsv3/sata11/15869560895/data/pi-dyland/scripts/autodeploy.sh
