@@ -7,3 +7,9 @@ dist
 .github
 *.log
 .DS_Store
+
+# Frontend build artifacts (Dockerfile's `frontend` stage rebuilds these
+# from source; local copies would only slow the context transfer).
+web-next/.next
+web-next/out
+src/web-next

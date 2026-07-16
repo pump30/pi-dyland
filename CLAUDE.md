@@ -53,6 +53,10 @@ pi-dyland/
 │   └── <name>/             # each skill = one directory
 │       ├── skill.json      # manifest
 │       └── run.sh          # entry (or custom, set via manifest.entry)
+├── scripts/                # NAS ops helpers (not application code)
+│   ├── autodeploy.sh                  # poll origin/main, reconcile container — see §15.5
+│   ├── pi-dyland-autodeploy.service   # systemd oneshot
+│   └── pi-dyland-autodeploy.timer     # 60s trigger
 ├── Dockerfile
 ├── docker-compose.yml      # kept for reference; NAS uses raw `docker run`
 ├── .dockerignore
@@ -70,6 +74,7 @@ Rules:
 - **`skills/` is the only extension point.** Do not add extension mechanisms elsewhere.
 - **No `public/`, no `assets/` at repo root.** Frontend source lives under `web-next/src/`; build output lands in `src/web-next/` (gitignored) and is served relative to `import.meta.url`.
 - **No `tests/`** exists yet; when tests are added they go in `test/` at repo root and use `node --test`. Do **not** introduce vitest/jest.
+- **`scripts/` is for NAS ops only** — the autodeploy shell script and its two systemd units. Do not put application code, CI logic, or task runners here. Adding a fourth file needs justification: see §15.5.
 
 ---
 
@@ -289,6 +294,7 @@ All configuration flows through `.env` on the NAS, sourced by `docker run --env-
    - `Cloudflare API Token` — tunnel + DNS management
    - `DAV (Radicale on NAS)` — CalDAV
    - Gmail app password lives inline in the sibling `send-email` Claude Code skill (already known); when moving to pi-dyland `.env`, do not commit.
+6. **Autodeploy notification credentials** live in a **separate** file on NAS: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy-notify.env` (chmod 600, owned by user `15869560895`). Contains only `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, optionally `SMTP_TO`. **Physically isolated** from the app `.env` so a leak in one does not compromise the other, and so `autodeploy.sh` (running on the host, outside the container) never has to source the app's `.env`. Not committed anywhere.
 
 ---
 
@@ -348,7 +354,9 @@ npm run dev          # tsx watch src/server.ts
 - Never introduce a `postinstall` script. Lifecycle scripts require review.
 - Never bump `pi-*` versions without confirming they still expose the API surface used by `agent-factory.ts` (`Agent`, `streamSimple`, `Model<"anthropic-messages">`, `ImageContent`).
 
-### 15.2 NAS deployment (authoritative flow)
+### 15.2 NAS deployment (manual / recovery flow)
+
+> **Default path is autodeploy (§15.5).** This section covers the manual flow used for feature-branch previews (not `main`), first-time provisioning, and recovery when autodeploy is disabled or stuck.
 
 NAS access:
 ```bash
@@ -406,6 +414,67 @@ sudo docker run -d --name pi-dyland \
 - If a request hangs > 30s locally on NAS but heartbeats reach the client, aicore-proxy or SAP AI Core is slow; check `docker logs aicore-proxy` for the same time window.
 - If the agent gets stuck in "already processing" state (client aborted mid-stream), `docker restart pi-dyland` clears it. This is a known rough edge; do not paper over with retry logic.
 
+### 15.5 Autodeploy (main → NAS)
+
+**Default deployment path.** A systemd oneshot service on the NAS polls `origin/main` every 60s. When the local `main` diverges from `origin/main` it reconciles the running container automatically.
+
+**Files** (all live in `scripts/`, checked into the repo):
+- `autodeploy.sh` — the polling reconciler.
+- `pi-dyland-autodeploy.service` — systemd unit (`Type=oneshot`).
+- `pi-dyland-autodeploy.timer` — 60s recurrence.
+
+**Runtime footprint on NAS** (installed once, see "Provisioning" below):
+- The two systemd unit files are copied to `/etc/systemd/system/`.
+- SMTP notification credentials live at `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy-notify.env` (§11.6).
+- Log: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy.log`.
+- Status: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy.status` (one line: `ok@<sha>` / `build_failed@<sha>` / `unhealthy@<sha>` / etc).
+- Lock: `.../pi-dyland-data/autodeploy.lock` — `flock` prevents overlapping ticks during a slow build.
+
+**Action classification** (must stay in sync with `autodeploy.sh`'s case block):
+
+| Files touched by the commit | Action |
+|---|---|
+| `Dockerfile`, `.dockerignore`, `package.json`, `tsconfig.json`, or any `web-next/**` | `docker build -t pi-dyland:candidate` → on success `docker rm -f && docker tag → :local && docker run`. On failure, old container keeps running and an alert email fires. |
+| Any `src/**` or any `skills/*/skill.json` | `docker restart pi-dyland`. |
+| Only `skills/*/run.sh` | **No-op.** `skills/` is bind-mounted `:ro` and the shell reads `run.sh` at each invocation. |
+| Only `scripts/**` | **No-op.** systemd re-execs the script on each tick, so the new version takes effect one cycle later without any explicit reload. |
+| Only docs, README, `.env.example` warnings, etc. | **No-op.** |
+
+**Hard rules — do not "relax" without amending this section:**
+- **Autodeploy never touches `.env`.** If `.env` shows up in `git diff` between `LOCAL_SHA` and `REMOTE_SHA`, the script refuses to deploy, alerts, and exits non-zero. This defends §11.4 (`.env` is git-ignored) against future mistakes.
+- **`.env.example` changes are non-blocking** but always send an alert email so the owner can decide whether to sync the NAS `.env` manually. Autodeploy never edits `.env`.
+- **Build failures preserve the running container.** The candidate tag pattern (`pi-dyland:candidate` first, swap to `:local` only after `docker build` returns 0) means a broken commit does not take the service down. The email alert is the operator's job to notice; there is no automatic rollback of git state — the working tree still lands on the broken commit so the next fix can be a follow-up commit, not a revert dance.
+- **Health check is the source of truth for "deployed OK".** `curl -sSf http://127.0.0.1:8787/health` within 5s after the action. If it fails, status file is `unhealthy@<sha>` and an alert fires. The container is not automatically rolled back — the operator investigates.
+- **No cross-branch support.** Only `origin/main` is watched. Feature branches use §15.2 manual flow.
+
+**Pause / resume:**
+```bash
+sudo systemctl stop pi-dyland-autodeploy.timer      # pause
+sudo systemctl start pi-dyland-autodeploy.timer     # resume
+sudo systemctl disable pi-dyland-autodeploy.timer   # pause + survive reboot
+```
+When paused, the NAS behaves exactly like pre-autodeploy: §15.2 is the operator's path.
+
+**Debugging:**
+```bash
+journalctl -u pi-dyland-autodeploy --since '10 min ago'          # systemd view
+tail -f /tmp/zfsv3/.../pi-dyland-data/autodeploy.log             # script view
+cat /tmp/zfsv3/.../pi-dyland-data/autodeploy.status              # last outcome
+```
+
+**Provisioning** (one-time, after PR that adds §15.5 files is merged to main and pulled onto NAS):
+```bash
+sudo cp /tmp/zfsv3/.../pi-dyland/scripts/pi-dyland-autodeploy.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-dyland-autodeploy.timer
+# then write the SMTP creds file (§11.6):
+umask 077 && cat > /tmp/zfsv3/.../pi-dyland-data/autodeploy-notify.env <<'EOF'
+SMTP_HOST=smtp.gmail.com
+SMTP_USER=<gmail user>
+SMTP_PASS=<gmail app password>
+EOF
+```
+
 ---
 
 ## 16. What is out of scope (do not build unprompted)
@@ -416,8 +485,7 @@ sudo docker run -d --name pi-dyland \
 - Voice input, audio output, image generation.
 - Streaming file uploads, chunked file processing, PDF/Office parsing.
 - Docker Compose migration, Kubernetes, ECS.
-- CI pipelines beyond what already exists.
-- Auto-updater, webhook-triggered redeploys.
+- Webhook-triggered redeploys, GitHub Actions, self-hosted runners, or any push-based CI. **Polling-based autodeploy is scoped in §15.5 and is the only automation surface.**
 - Rate limiting, CSRF tokens, CORS — the service is single-user behind Basic Auth on a private hostname.
 
 If any of the above is requested, revisit this file and add the new rule set explicitly.

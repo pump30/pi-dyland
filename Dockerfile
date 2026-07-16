@@ -1,9 +1,20 @@
 # pi-dyland: personal agent HTTP service.
 #
-# Two-stage image: install deps once, then copy source. The image includes
-# curl+jq+bash for the shell-based skills. Runtime uses Node 22 with the
-# native TypeScript stripper (--experimental-strip-types) so we don't need
-# to precompile.
+# Three-stage image:
+#   1. frontend — builds the Next.js static export into /web/out.
+#   2. deps     — installs backend production npm deps.
+#   3. runtime  — assembles the final image.
+# The runtime uses Node 22 with the native TypeScript stripper
+# (--experimental-strip-types) so we don't need to precompile the backend.
+FROM node:22-bookworm-slim AS frontend
+WORKDIR /web
+# Install deps first so the layer cache survives source edits.
+COPY web-next/package.json ./
+RUN npm install --ignore-scripts
+COPY web-next/ ./
+# next.config.ts sets `output: "export"` → produces /web/out
+RUN npm run build
+
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json ./
@@ -22,6 +33,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
 COPY src ./src
 COPY skills ./skills
+# Frontend static export — server.ts serves this from /app/src/web-next.
+COPY --from=frontend /web/out ./src/web-next
 
 # Make skill scripts executable (bind-mounted skills also work at runtime).
 RUN find ./skills -type f -name 'run.sh' -exec chmod +x {} +
