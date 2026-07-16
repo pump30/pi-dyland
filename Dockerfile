@@ -40,11 +40,16 @@ COPY package.json ./
 # stage can COPY --from=modelcache and be network-independent.
 ENV TRANSFORMERS_CACHE=/root/.cache/huggingface \
     HF_HOME=/root/.cache/huggingface
-RUN node --experimental-strip-types --no-warnings -e "\
-  const {pipeline} = await import('@xenova/transformers');\
-  await pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2');\
-  console.log('embedder cached');\
-"
+# Download the ONNX embedding model. NAS outbound is flaky so we retry up to
+# 5 times with a 10s backoff. Once cached in this layer, subsequent builds
+# skip the download entirely (Docker layer cache).
+RUN for i in 1 2 3 4 5; do \
+  node --experimental-strip-types --no-warnings -e "\
+    const {pipeline} = await import('@xenova/transformers');\
+    await pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2');\
+    console.log('embedder cached');\
+  " && break || { echo "attempt $i failed, retrying in 10s..."; sleep 10; }; \
+done
 
 FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
