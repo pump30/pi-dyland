@@ -1,6 +1,8 @@
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import type { Agent } from "@earendil-works/pi-agent-core";
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { streamSSE } from "hono/streaming";
@@ -10,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { createPersonalAgent } from "./agent-factory.ts";
 import { loadSkills } from "./skill-loader.ts";
+import { initMemory } from "./memory.ts";
 
 // -----------------------------------------------------------------------------
 // Config from env
@@ -21,8 +24,10 @@ const AICORE_TOKEN = process.env.AICORE_TOKEN ?? "";
 const PORT = Number.parseInt(process.env.PORT ?? "8787", 10);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const SKILLS_PATH = (process.env.SKILLS_PATH ?? "./skills").split(":").filter(Boolean);
+const CLAUDE_SKILLS_PATH = (process.env.CLAUDE_SKILLS_PATH ?? "").split(":").filter(Boolean);
 const AUTH_USER = process.env.AUTH_USER ?? "";
 const AUTH_PASS = process.env.AUTH_PASS ?? "";
+const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
 
 if (!AICORE_TOKEN) {
 	console.error("[server] AICORE_TOKEN is not set. The agent cannot call the LLM backend.");
@@ -38,20 +43,115 @@ if (!authEnabled) {
 }
 
 // -----------------------------------------------------------------------------
-// Load skills, build the singleton agent
+// Load skills; build per-thread agents lazily.
 // -----------------------------------------------------------------------------
 
-const skills = await loadSkills({ roots: SKILLS_PATH });
+await initMemory(DATA_DIR);
+
+const skills = await loadSkills({ roots: SKILLS_PATH, claudeSkillRoots: CLAUDE_SKILLS_PATH });
 console.log(`[server] loaded ${skills.length} skill(s): ${skills.map((s) => s.manifest.name).join(", ") || "(none)"}`);
 
-const agent = createPersonalAgent({
-	aicore: {
-		baseUrl: AICORE_BASE_URL,
-		modelId: AICORE_MODEL,
-		apiKey: AICORE_TOKEN,
-	},
-	tools: skills.map((s) => s.tool),
-});
+// Thread registry. Each thread owns one pi Agent with its own message history.
+// Bounded by MAX_THREADS; oldest lastActiveAt evicted when full. Not persisted
+// across restarts — message history is intentionally in-memory (see CLAUDE.md
+// §9). Only the thread list metadata is persisted so the sidebar survives a
+// browser reload; on cold start we start empty.
+const MAX_THREADS = 50;
+const DEFAULT_THREAD_ID = "default";
+
+interface ThreadEntry {
+	id: string;
+	title: string;
+	agent: Agent;
+	createdAt: number;
+	lastActiveAt: number;
+	/**
+	 * True while an agent.prompt() call is running for this thread. Used to
+	 * reject overlapping /chat requests (pi-agent-core would throw "already
+	 * processing" anyway; we surface a cleaner error and let the client offer
+	 * a Stop/Cancel path).
+	 */
+	inFlight: boolean;
+}
+
+const threads = new Map<string, ThreadEntry>();
+
+function newAgent(): Agent {
+	return createPersonalAgent({
+		aicore: { baseUrl: AICORE_BASE_URL, modelId: AICORE_MODEL, apiKey: AICORE_TOKEN },
+		tools: skills.map((s) => s.tool),
+	});
+}
+
+/**
+ * Replace a thread's Agent with a fresh instance and drop the old one.
+ *
+ * pi-agent-core does not expose a public "abort in-flight prompt" API. Once
+ * `agent.prompt()` has been called, the only way to guarantee the thread can
+ * accept a new prompt is to walk away from the old Agent entirely. The old
+ * instance's promise continues to run to completion in the background (and
+ * its outputs are discarded because we already unsubscribed), which is
+ * memory-wasteful but bounded and safe.
+ *
+ * This mirrors DeerFlow's philosophy: rather than fixing a jammed run, delete
+ * the thread state and start fresh. Here we keep the thread identity and just
+ * swap the Agent underneath so the client's threadId stays valid.
+ */
+function rebuildAgent(entry: ThreadEntry): void {
+	entry.agent = newAgent();
+	entry.inFlight = false;
+	entry.lastActiveAt = Date.now();
+}
+
+function evictOldestIfFull(): void {
+	if (threads.size < MAX_THREADS) return;
+	let oldestId: string | null = null;
+	let oldestTs = Number.POSITIVE_INFINITY;
+	for (const [id, entry] of threads) {
+		if (id === DEFAULT_THREAD_ID) continue; // never evict the fallback thread
+		if (entry.lastActiveAt < oldestTs) {
+			oldestTs = entry.lastActiveAt;
+			oldestId = id;
+		}
+	}
+	if (oldestId) {
+		threads.delete(oldestId);
+		console.log(`[server] evicted LRU thread ${oldestId}`);
+	}
+}
+
+function getOrCreateThread(threadId: string, titleHint?: string): ThreadEntry {
+	let entry = threads.get(threadId);
+	if (!entry) {
+		evictOldestIfFull();
+		entry = {
+			id: threadId,
+			title: titleHint ?? (threadId === DEFAULT_THREAD_ID ? "Default" : "New chat"),
+			agent: newAgent(),
+			createdAt: Date.now(),
+			lastActiveAt: Date.now(),
+			inFlight: false,
+		};
+		threads.set(threadId, entry);
+	} else {
+		entry.lastActiveAt = Date.now();
+	}
+	return entry;
+}
+
+function threadIdFrom(c: { req: { query: (k: string) => string | undefined; header: (k: string) => string | undefined } }): string {
+	const q = c.req.query("thread");
+	const h = c.req.header("x-thread-id");
+	const id = (q ?? h ?? DEFAULT_THREAD_ID).trim();
+	// keep IDs safe: only allow default or UUID-ish shapes
+	if (id === DEFAULT_THREAD_ID) return id;
+	if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) return DEFAULT_THREAD_ID;
+	return id;
+}
+
+// Ensure a default thread always exists so legacy single-thread callers (old
+// UI, curl) keep working.
+getOrCreateThread(DEFAULT_THREAD_ID);
 
 // -----------------------------------------------------------------------------
 // HTTP server
@@ -89,6 +189,7 @@ app.get("/health", (c) =>
 		ok: true,
 		aicore: { baseUrl: AICORE_BASE_URL, model: AICORE_MODEL },
 		skills: skills.map((s) => ({ name: s.manifest.name, label: s.manifest.label })),
+		threads: threads.size,
 	}),
 );
 
@@ -103,11 +204,84 @@ app.get("/skills", (c) =>
 	),
 );
 
-app.get("/messages", (c) => c.json(agent.state.messages));
+// -----------------------------------------------------------------------------
+// Threads CRUD. Each thread has its own pi Agent + message history.
+// -----------------------------------------------------------------------------
+
+app.get("/threads", (c) => {
+	const list = Array.from(threads.values())
+		.map((t) => ({
+			id: t.id,
+			title: t.title,
+			createdAt: t.createdAt,
+			lastActiveAt: t.lastActiveAt,
+			messageCount: t.agent.state.messages.length,
+			inFlight: t.inFlight,
+		}))
+		.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+	return c.json(list);
+});
+
+app.post("/threads", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) as { title?: unknown };
+	const rawTitle = typeof body.title === "string" ? body.title.trim().slice(0, 120) : "";
+	const id = randomUUID();
+	const entry = getOrCreateThread(id, rawTitle || "New chat");
+	return c.json({ id: entry.id, title: entry.title, createdAt: entry.createdAt, lastActiveAt: entry.lastActiveAt, messageCount: 0 });
+});
+
+app.patch("/threads/:id", async (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ error: "not found" }, 404);
+	const body = (await c.req.json().catch(() => ({}))) as { title?: unknown };
+	if (typeof body.title === "string") {
+		entry.title = body.title.trim().slice(0, 120) || entry.title;
+	}
+	return c.json({ id: entry.id, title: entry.title });
+});
+
+app.delete("/threads/:id", (c) => {
+	const id = c.req.param("id");
+	if (id === DEFAULT_THREAD_ID) return c.json({ error: "cannot delete default thread" }, 400);
+	threads.delete(id);
+	return c.json({ ok: true });
+});
+
+app.get("/messages", (c) => {
+	const id = threadIdFrom(c);
+	const entry = threads.get(id);
+	if (!entry) return c.json([]);
+	return c.json(entry.agent.state.messages);
+});
 
 app.post("/reset", (c) => {
-	agent.reset();
-	return c.json({ ok: true });
+	const id = threadIdFrom(c);
+	const entry = threads.get(id);
+	if (!entry) return c.json({ ok: true, action: "noop" });
+	// Rebuild the Agent unconditionally. If a prompt was in flight, this is
+	// the only way to guarantee the thread accepts new prompts — pi-agent-core
+	// has no public abort API. If no prompt was running, this is equivalent to
+	// agent.reset() but also clears any subscription bookkeeping.
+	rebuildAgent(entry);
+	return c.json({ ok: true, action: "rebuilt" });
+});
+
+/**
+ * POST /threads/:id/cancel
+ *
+ * DeerFlow-equivalent of the LangGraph `runs/{run_id}/cancel` endpoint.
+ * pi-agent-core cannot interrupt an in-flight prompt, so we walk away from
+ * the Agent instance and hand the thread a fresh one. The client should also
+ * abort its SSE fetch so the /chat handler's `finally` unsubscribes.
+ */
+app.post("/threads/:id/cancel", (c) => {
+	const id = c.req.param("id");
+	const entry = threads.get(id);
+	if (!entry) return c.json({ ok: true, action: "noop" });
+	const wasInFlight = entry.inFlight;
+	rebuildAgent(entry);
+	return c.json({ ok: true, action: "rebuilt", wasInFlight });
 });
 
 // POST /chat  { prompt: string }
@@ -140,6 +314,7 @@ interface ChatBody {
 	prompt?: unknown;
 	images?: unknown;
 	files?: unknown;
+	threadId?: unknown;
 }
 
 interface ValidatedAttachments {
@@ -203,6 +378,31 @@ function buildPromptText(prompt: string, files: ChatFile[]): string {
 	return parts.join("\n\n");
 }
 
+// Slash-trigger: `/skill_name rest of prompt` prepends a soft directive so the
+// LLM prefers that tool for the turn. Kebab and snake are both accepted (the
+// UI shows snake_case skill names, but /send-email is Claude Code muscle
+// memory). Unknown skills fall through — the raw prompt is kept.
+//
+// The hint is wrapped in `<system_hint>...</system_hint>` so the browser
+// client can strip it before rendering user messages loaded from history.
+// LLMs accept the XML-tagged directive without much confusion; keeping it
+// inside the user message avoids inventing a new AgentMessage kind.
+const SLASH_RE = /^\/([a-z][a-z0-9_-]*)(\s|$)([\s\S]*)$/;
+const SYSTEM_HINT_OPEN = "<system_hint>";
+const SYSTEM_HINT_CLOSE = "</system_hint>";
+
+function applySlashHint(prompt: string): { prompt: string; skill: string | null } {
+	const m = prompt.match(SLASH_RE);
+	if (!m) return { prompt, skill: null };
+	const raw = (m[1] ?? "").replace(/-/g, "_");
+	const skill = skills.find((s) => s.manifest.name === raw);
+	if (!skill) return { prompt, skill: null };
+	const rest = (m[3] ?? "").trim();
+	const hint = `${SYSTEM_HINT_OPEN}The user invoked /${skill.manifest.name}. Prefer the "${skill.manifest.name}" tool for this turn unless it clearly does not apply.${SYSTEM_HINT_CLOSE}`;
+	const body = rest || `Ask me for the parameters the ${skill.manifest.name} tool needs.`;
+	return { prompt: `${hint}\n\n${body}`, skill: skill.manifest.name };
+}
+
 app.post("/chat", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as ChatBody;
 	const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -214,7 +414,44 @@ app.post("/chat", async (c) => {
 	if (!prompt && parsed.images.length === 0 && parsed.files.length === 0) {
 		return c.json({ error: "prompt or attachments required" }, 400);
 	}
-	const promptText = buildPromptText(prompt || "See attached.", parsed.files);
+	// Resolve thread: body.threadId wins, else query/header, else DEFAULT.
+	// Body wins because the browser client always posts JSON.
+	let threadId: string = DEFAULT_THREAD_ID;
+	if (typeof body.threadId === "string" && body.threadId.trim()) {
+		const candidate = body.threadId.trim();
+		threadId =
+			candidate === DEFAULT_THREAD_ID || /^[a-zA-Z0-9_-]{1,64}$/.test(candidate)
+				? candidate
+				: DEFAULT_THREAD_ID;
+	} else {
+		threadId = threadIdFrom(c);
+	}
+	const entry = getOrCreateThread(threadId);
+	// Reject concurrent prompts on the same thread. The client should either
+	// wait for the current stream to finish or call /threads/:id/cancel first.
+	// pi-agent-core would also throw "already processing" internally; catching
+	// it here means we don't waste a subscription bind.
+	if (entry.inFlight) {
+		return c.json(
+			{
+				error: "thread busy",
+				message:
+					"Another prompt is still streaming on this thread. Wait for it to finish or POST /threads/" +
+					threadId +
+					"/cancel to abort.",
+			},
+			409,
+		);
+	}
+	const agent = entry.agent;
+	entry.inFlight = true;
+	// Auto-derive title from first user prompt if still the default.
+	if ((entry.title === "New chat" || entry.title === "Default") && prompt) {
+		entry.title = prompt.slice(0, 40).replace(/\s+/g, " ").trim();
+	}
+	const slashResult = applySlashHint(prompt);
+	const effectivePrompt = slashResult.prompt || prompt || "See attached.";
+	const promptText = buildPromptText(effectivePrompt, parsed.files);
 	const images = parsed.images;
 
 	return streamSSE(c, async (stream) => {
@@ -229,6 +466,10 @@ app.post("/chat", async (c) => {
 		const send = async (data: Record<string, unknown>) => {
 			await stream.writeSSE({ data: JSON.stringify(data) });
 		};
+
+		if (slashResult.skill) {
+			await send({ type: "skill_hint", name: slashResult.skill });
+		}
 
 		const unsubscribe = agent.subscribe(async (event) => {
 			switch (event.type) {
@@ -272,27 +513,43 @@ app.post("/chat", async (c) => {
 		} finally {
 			clearInterval(heartbeat);
 			unsubscribe();
+			// Only clear inFlight if this stream still owns the current Agent.
+			// If /threads/:id/cancel or /reset rebuilt the Agent while we were
+			// running, entry.agent now points to a fresh instance and its
+			// inFlight was already reset by rebuildAgent().
+			if (entry.agent === agent) entry.inFlight = false;
 		}
 	});
 });
 
 // -----------------------------------------------------------------------------
-// Static chat UI
+// Static UI: Next.js static export lives under src/web-next/. Build via
+// `cd web-next && npm run build`, then rsync the out/ contents into
+// src/web-next/. The Dockerfile copies src/web-next/ into the image.
 // -----------------------------------------------------------------------------
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const webRoot = path.join(__dirname, "web");
+const webRoot = path.join(__dirname, "web-next");
 
 app.get("/", async (c) => {
-	const html = await readFile(path.join(webRoot, "index.html"), "utf8");
-	return c.html(html);
+	try {
+		const html = await readFile(path.join(webRoot, "index.html"), "utf8");
+		return c.html(html);
+	} catch {
+		return c.text(
+			"UI not built. Run `cd web-next && npm run build` and copy web-next/out/* into src/web-next/.",
+			500,
+		);
+	}
 });
 
+// Serve everything under src/web-next/ at the root. Next.js static export
+// emits _next/, favicon.ico, and named .html files (only / and /404 for us),
+// so we mount at "/*" and let unmatched fall through to 404.
 app.use(
-	"/web/*",
+	"/*",
 	serveStatic({
 		root: path.relative(process.cwd(), webRoot) || ".",
-		rewriteRequestPath: (p) => p.replace(/^\/web\//, "/"),
 	}),
 );
 

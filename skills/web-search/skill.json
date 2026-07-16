@@ -1,0 +1,29 @@
+{
+  "name": "web_search",
+  "label": "Web Search",
+  "description": "Search the public web via Tavily. Use when the user asks about recent news, real-time facts, current events, prices, or anything the model may not know from training (post-training cutoff). Returns AI answer (when available) plus top results with titles, URLs, and snippets.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query in the user's original language. Be specific."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Number of results to return. Default 5, max 10.",
+        "default": 5
+      },
+      "search_depth": {
+        "type": "string",
+        "description": "Tavily search depth. 'basic' is fast and free; 'advanced' spends more credits for deeper analysis. Default 'basic'.",
+        "enum": ["basic", "advanced"],
+        "default": "basic"
+      }
+    },
+    "required": ["query"]
+  },
+  "entry": "run.sh",
+  "env": ["TAVILY_API_KEY"],
+  "timeoutMs": 20000
+}

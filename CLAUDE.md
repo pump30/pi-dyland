@@ -33,13 +33,22 @@ Non-goals: multi-tenant sessions, per-request agent instances, plugin marketplac
 
 ```
 pi-dyland/
-├── src/
+├── src/                    # Node backend (Hono + pi-agent-core)
 │   ├── server.ts           # Hono app, routes, SSE, middleware — single entry
 │   ├── agent-factory.ts    # Model<anthropic-messages> + Agent + streamFn wrapper
 │   ├── skill-loader.ts     # scan skills/*/skill.json → AgentTool[]
-│   └── web/                # served as /web/* (static); GET / reads index.html
+│   ├── memory.ts           # long-term memory: profile.json / preferences.json + `remember` tool
+│   └── web-next/           # BUILD OUTPUT of web-next/ (Next.js static export) — gitignored
 │       ├── index.html
-│       └── app.js
+│       ├── 404.html
+│       └── _next/static/…
+├── web-next/               # Next.js + React + Tailwind + shadcn frontend source
+│   ├── src/app/            # App Router (page.tsx, layout.tsx, globals.css)
+│   ├── src/components/     # ChatApp, ThreadSidebar, Composer, MessageList, ToolCard, ui/*
+│   ├── src/lib/            # api.ts, types.ts, utils.ts, convert-messages.ts
+│   ├── next.config.ts      # output: "export", trailingSlash: true
+│   ├── tailwind.config.ts
+│   └── package.json        # Node 22, pnpm-optional, exact-pinned
 ├── skills/
 │   └── <name>/             # each skill = one directory
 │       ├── skill.json      # manifest
@@ -49,7 +58,7 @@ pi-dyland/
 ├── .dockerignore
 ├── .env.example            # authoritative list of supported env vars
 ├── .gitignore
-├── package.json            # exact-pinned deps
+├── package.json            # backend deps, exact-pinned
 ├── tsconfig.json           # noEmit, strict
 ├── README.md
 └── CLAUDE.md
@@ -59,7 +68,7 @@ Rules:
 - **Do not add a `src/routes/`, `src/services/`, `src/utils/` layer.** The server has 6 routes; splitting is premature and hurts readability. Keep everything in `src/*.ts` flat.
 - **Never introduce `dist/`, `build/`, or a bundler output.** Node strips TS at runtime.
 - **`skills/` is the only extension point.** Do not add extension mechanisms elsewhere.
-- **No `public/`, no `assets/`.** Static files live under `src/web/` and are served relative to `import.meta.url`.
+- **No `public/`, no `assets/` at repo root.** Frontend source lives under `web-next/src/`; build output lands in `src/web-next/` (gitignored) and is served relative to `import.meta.url`.
 - **No `tests/`** exists yet; when tests are added they go in `test/` at repo root and use `node --test`. Do **not** introduce vitest/jest.
 
 ---
@@ -76,7 +85,9 @@ Explicitly forbidden new files:
 - `src/logger.ts` — `console.log/error` prefixed with `[server]` / `[req]` / `[chat]` is enough; do not adopt pino/winston.
 - `src/types.ts` — inline interfaces where used. Only `agent-factory.ts` exports types (`AicoreModelConfig`, `CreateAgentOptions`); nothing else needs a shared type file.
 - `src/middleware/` — Hono middleware is 3–8 lines each; keep inline in `server.ts`.
-- Anything under `src/web/` beyond `index.html` + `app.js`. If styles grow, keep them in the `<style>` block of `index.html`; do **not** split out CSS.
+- Backend files under `src/` beyond `server.ts`/`agent-factory.ts`/`skill-loader.ts`/`memory.ts` need a real justification; `src/web-next/` is a build artifact (see §10) and does not count.
+
+Frontend (`web-next/`) follows Next.js App Router conventions: `src/app/` for routes, `src/components/` for React components, `src/lib/` for helpers. New components / hooks / types under those trees do not need explicit approval — but keep the number of components small; do not duplicate shadcn primitives.
 
 New skill = new directory under `skills/`. Never scatter skill code elsewhere.
 
@@ -85,14 +96,13 @@ New skill = new directory under `skills/`. Never scatter skill code elsewhere.
 ## 5. Coding rules
 
 ### 5.1 Language & syntax
-- TypeScript in `src/`, plain ES2020 JS in `src/web/`. No JSX anywhere.
-- **No JSX / React / Vue / Svelte / Preact / anything DOM-VDOM.** UI stays vanilla.
-- Only **erasable TS syntax** in `src/` (Node strip-only mode): no `enum`, no `namespace`, no parameter properties (`constructor(private x)`), no `import =`, no `export =`. Use explicit fields + constructor assignment.
-- Top-level imports only. **No `await import()`, no `import("x").Type`, no dynamic type imports.**
+- **Backend** (`src/*.ts`, excluding `src/web-next/`): TypeScript strip-only mode. **No JSX** in backend code. Erasable TS syntax only: no `enum`, no `namespace`, no parameter properties (`constructor(private x)`), no `import =`, no `export =`. Use explicit fields + constructor assignment.
+- **Frontend** (`web-next/`): Next.js 15 + React 19 + TypeScript + Tailwind CSS + shadcn/ui components. JSX allowed here and here only. See §10 for the rest of the frontend contract.
+- Top-level imports only in backend. **No `await import()`, no `import("x").Type`, no dynamic type imports.**
 - No `any` unless the pi/Hono type surface leaves no alternative; when unavoidable, immediately narrow at the boundary with `as`.
 - Prefer `unknown` for untrusted input (`c.req.json()` result), narrow with type-guards inline.
 - Strings: double quotes to match existing file style. Semicolons: required (existing style).
-- Async: `async/await` only, no bare `.then()` chains except for one-shot fire-and-forget in `app.js`.
+- Async: `async/await` only, no bare `.then()` chains except for one-shot fire-and-forget on the frontend.
 
 ### 5.2 Imports
 - Order within a file: node built-ins → third-party → workspace-local (`./`). Blank line between groups. Match existing ordering in `server.ts`.
@@ -135,13 +145,18 @@ Existing routes are the complete API. Do **not** add REST-y CRUD or "future-proo
 
 | Route | Method | Contract |
 |---|---|---|
-| `/health` | GET | Public. Returns `{ok, aicore:{baseUrl, model}, skills:[{name,label}]}`. Never require auth. Never add PII. |
+| `/health` | GET | Public. Returns `{ok, aicore:{baseUrl, model}, skills:[{name,label}], threads}`. Never require auth. Never add PII. |
 | `/skills` | GET | Auth. Returns manifest array (name, label, description, parameters). Read-only. |
-| `/messages` | GET | Auth. Full transcript from the singleton agent. Read-only. |
-| `/reset` | POST | Auth. Calls `agent.reset()`. No body. Idempotent. |
-| `/chat` | POST | Auth. Body: `{prompt?, images?, files?}`. Response: SSE. |
-| `/` | GET | Auth. Serves `src/web/index.html`. |
-| `/web/*` | GET | Auth. Static file server rooted at `src/web/`. |
+| `/threads` | GET | Auth. Returns `[{id, title, createdAt, lastActiveAt, messageCount, inFlight}]` sorted by `lastActiveAt` desc. |
+| `/threads` | POST | Auth. Body `{title?}`. Creates a new thread (UUID id), returns the entry. |
+| `/threads/:id` | PATCH | Auth. Body `{title?}`. Renames. 404 if unknown. |
+| `/threads/:id` | DELETE | Auth. Deletes non-default thread; returns 400 for `default`. |
+| `/threads/:id/cancel` | POST | Auth. Rebuilds the thread's Agent instance, dropping any in-flight prompt. Returns `{ok, action, wasInFlight}`. Safe no-op if the thread has no Agent yet. DeerFlow-equivalent of LangGraph's `runs/:run_id/cancel`. |
+| `/messages` | GET | Auth. Full transcript of the thread selected via `?thread=<id>` or `X-Thread-Id` header. Defaults to `default`. Read-only. |
+| `/reset` | POST | Auth. **Rebuilds** the thread's Agent (drops messages + any stuck run). Returns `{ok, action}`. Idempotent. |
+| `/chat` | POST | Auth. Body: `{prompt?, images?, files?, threadId?}` (threadId defaults to `default`, also honors `?thread=`/`X-Thread-Id`). Response: SSE. Returns **409 "thread busy"** if the thread already has a prompt streaming — client must wait or hit `/threads/:id/cancel`. Server may auto-derive the thread title from the first user prompt. |
+| `/` | GET | Auth. Serves `src/web-next/index.html` (Next.js static export). |
+| `/*` | GET | Auth. Static file server rooted at `src/web-next/` for `_next/static/…` and other Next assets. Falls through to 404 for unknown paths. |
 
 Rules:
 - Every route except `/health` is Basic-Auth-protected via one `app.use("*", ...)` middleware. **Do not add per-route auth middleware.** If a new route must be public, extend the `/health` bypass explicitly.
@@ -159,12 +174,15 @@ Rules:
 
 ## 7. Agent & LLM rules (`src/agent-factory.ts`)
 
-- The agent is a **singleton per process**. `server.ts` builds one at startup and never rebuilds it. Do not per-request or per-session-key the agent unless multi-user is explicitly requested.
+- The agent is **per-thread**. `server.ts` maintains `Map<threadId, Agent>` (bounded by `MAX_THREADS=50`, LRU-evicted; `default` thread is never evicted). Legacy single-thread callers (old UI, curl without `?thread=`) implicitly use the `default` thread. Do NOT per-request the agent — a thread's agent lives for the lifetime of the thread. Model config, tools, and system prompt are shared across all threads.
+- Thread IDs must match `^[a-zA-Z0-9_-]{1,64}$` or the literal `default`; invalid IDs are silently rewritten to `default` in `threadIdFrom()`. This is the boundary check for URL/header input.
+- **Cancel / stuck-agent recovery**: pi-agent-core has no public API to interrupt an in-flight `agent.prompt()`. `POST /threads/:id/cancel` and `POST /reset` both call `rebuildAgent()`, which **swaps `entry.agent` for a fresh instance and drops the stuck one**. The abandoned Agent's promise keeps running in the background (with its subscription already unsubscribed, so nothing is emitted), and pi-agent-core garbage-collects it. This is the DeerFlow-equivalent of "start a fresh run" — do NOT try to reach into pi-agent-core internals to abort the old prompt.
+- **`inFlight` semantics**: `ThreadEntry.inFlight` is set to `true` before `agent.prompt()` and cleared in `finally` — but only if `entry.agent === agent` (i.e., cancel/reset didn't swap the Agent while we were streaming). `POST /chat` rejects overlapping requests on the same thread with `409 "thread busy"` before pi-agent-core can throw its cryptic "already processing" error.
 - Model configuration is fixed to `api: "anthropic-messages"`, `provider: "superdyland"`, `baseUrl` from `AICORE_BASE_URL`. `contextWindow: 200_000`, `maxTokens: 32_000`. Do not lower.
 - **Bearer auth quirk (critical):** aicore-proxy uses `Authorization: Bearer <token>`, not `x-api-key`. pi-ai only auto-sends bearer when the token starts with `sk-ant-oat`. Our token is `sk-aicore-proxy-key` (aicore-proxy's own), so `buildAicoreStreamFn` wraps pi-ai's `streamSimple` and merges `Authorization` into `options.headers`. **Do not "clean up" this wrapper by moving auth to `Model.headers` — pi-ai's `assertRequestAuth` only inspects `options.headers`.**
 - `getApiKey` on `Agent` is not used; auth is header-injected via the wrapper. Do not reintroduce.
 - System prompt lives inline as `DEFAULT_SYSTEM_PROMPT` in `agent-factory.ts`. Keep it under 400 tokens. When editing, preserve the "Chinese with English technical terms" and "no filler" directives — they encode the owner's preference.
-- Tools passed at construction time. Adding a tool = adding a skill (see §8), not editing agent-factory.
+- Tools passed at construction time. Adding a tool = adding a skill (see §8), not editing agent-factory. The built-in `remember` tool (from `memory.ts`) is registered by `createPersonalAgent` alongside skills.
 
 ---
 
@@ -205,33 +223,57 @@ Forbidden in skills:
 
 Do **not** port arbitrary Claude Code SKILL.md skills wholesale. Each port requires a fresh `skill.json` + `run.sh` that captures the behaviour with structured args.
 
+**Description enrichment from Claude Code SKILL.md (Phase F):** if `CLAUDE_SKILLS_PATH` env is set (colon-separated), `skill-loader` looks for a same-named directory (snake ↔ kebab) and appends the SKILL.md frontmatter `description` to the pi skill's description under a "Claude Code companion notes:" line. This helps the LLM disambiguate tools using the richer Claude Code prose. **No SKILL.md scripts are executed**; the pi `skill.json + run.sh` remains the sole execution contract.
+
 **Current skill inventory (do not remove without confirmation):**
 - `nas-calendar` → tool `nas_calendar` (CalDAV via Radicale)
 - `send-email` → tool `send_email` (Gmail SMTPS)
 - `vault-lookup` → tool `vault_lookup` (kept as env-gated stub; never populate `VAULTWARDEN_TOKEN` in NAS `.env` — Vaultwarden master password never leaves the owner's Mac)
+- `web-search` → tool `web_search` (Tavily HTTP API; requires `TAVILY_API_KEY`)
 
 ---
 
 ## 9. Data & state rules
 
-- **No database.** No sqlite, no redis, no filesystem persistence for chat history.
-- The agent's `state.messages` is in-memory only. Loss on container restart is by design. Do not add persistence unless requested.
-- No global mutable singletons besides the `agent` instance in `server.ts`.
+- **No database.** No sqlite, no redis, no filesystem persistence for chat message history.
+- The agent's `state.messages` is in-memory only. Loss on container restart is by design.
+- **JSON files under `$DATA_DIR` are permitted** for durable long-term memory only: `profile.json` (LLM-written via the built-in `remember` tool) and `preferences.json` (user-written). Managed by `src/memory.ts`. Reads at startup, writes atomically via temp+rename. Do **not** extend this to store chat transcripts, session state, or arbitrary logs.
+- `$DATA_DIR` defaults to `./data` locally; on NAS it must be bind-mounted from the host (`/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data` → `/data`) so memory survives `docker rm -f`.
+- No global mutable singletons besides the thread `Map` and the memory-module `state` in `server.ts` / `memory.ts`.
 - No shared module-level caches. If caching is needed inside a skill, put it inside the skill's process (it dies with the subprocess).
 - Env vars are read **once** at module load. Do not re-read `process.env` per request. **Reminder:** because Docker `--env-file` is captured at `docker run` time, changing `.env` requires `docker rm -f pi-dyland && docker run ...`. `docker restart` will NOT re-read.
 
 ---
 
-## 10. Frontend rules (`src/web/`)
+## 10. Frontend rules (`web-next/`, built into `src/web-next/`)
 
-- Vanilla JS + native DOM APIs. Target: modern evergreen browsers (Chromium ≥ 100, Safari ≥ 15, Firefox ≥ 100).
-- No package.json for the web side. No bundler, no npm module in `app.js`. If a helper is needed, write it inline.
-- CSS lives in the `<style>` block of `index.html`. Use the existing CSS custom properties in `:root { --bg, --panel, --border, --text, --muted, --accent, --user, --tool, --error }`. Do not introduce a second theme system.
-- IDs used by `app.js` and defined in `index.html` (`log`, `form`, `prompt`, `send`, `reset`, `skills-meta`, `attach`, `file-input`, `attachments`, `drop-overlay`) form a fixed contract. If renaming, update both files in the same commit.
-- SSE parsing lives in `app.js` and mirrors the event union in `server.ts`. Adding a new SSE event type requires updating `handleEvent` switch in `app.js`.
-- File & image attachment limits in `app.js` must match `server.ts` constants. Client-side check exists for UX (fast rejection), not security.
-- No file upload API besides base64-in-JSON. Do not introduce multipart/form-data.
-- No service worker, no PWA manifest, no offline mode. The UI is useless without the origin.
+- **Stack**: Next.js 15 (App Router, `output: "export"` static export), React 19, TypeScript, Tailwind CSS v3, shadcn/ui-style components (hand-rolled, not the shadcn CLI). Icons from `lucide-react`. Markdown via `react-markdown` + `remark-gfm`.
+- **No Next.js server runtime in production.** The build emits static HTML/JS/CSS into `web-next/out/`; deployment copies that into `src/web-next/` and Hono `serveStatic` serves it. Anything requiring SSR/`/api` routes/middleware is not allowed.
+- **API is same-origin at deploy time.** Frontend calls relative paths (`/threads`, `/chat`, `/skills`, …). In `next dev` on port 3000, set `NEXT_PUBLIC_API_BASE=http://127.0.0.1:8787` (already the default when `window.location.port === "3000"`). Never bake absolute prod URLs into the bundle.
+- **Component library rules**: shadcn-style components live under `web-next/src/components/ui/`. Hand-copy new primitives (Radix + `cva`); do **not** install a design system runtime (no Ant Design, MUI, Chakra). Keep icons in `lucide-react`.
+- **Theming**: single dark theme applied via `<html class="dark">` in `layout.tsx`. CSS variables in `web-next/src/app/globals.css` under `@layer base`. Do not add a light theme unless requested.
+- **Viewport**: `<body class="h-[100dvh] overflow-hidden">` + `viewport-fit: cover` + `themeColor: "#09090b"` in `layout.tsx`. `100dvh` (not `100vh`) is required so iOS Safari's dynamic address bar does not push the composer off-screen. Do not revert to `h-screen`.
+- **State**: React state + refs. No Redux, no Zustand, no React Query unless a real need appears. `localStorage` OK for the active-thread pointer only.
+- **SSE parsing** lives in `web-next/src/lib/api.ts` (`streamChat`) and the reducer in `web-next/src/components/chat-app.tsx` (`applySseEvent`). Event union must mirror the one emitted by `src/server.ts` in `/chat`. Adding an event type requires touching both sides in the same commit.
+- **Message shape conversion** (pi Agent raw `Message[]` → client `ChatMessage[]`) lives in `web-next/src/lib/convert-messages.ts`. Handles pairing `tool_use` blocks in assistant messages with `tool_result` in the following tool message, and stripping `<system_hint>` markers.
+- **Cancel / Stop wiring** (see §7 for the server contract):
+  - `abortRef` holds the current `fetch` AbortController; `sendingThreadRef` remembers which thread is streaming (may differ from `activeId` if the user switched).
+  - The Composer swaps Send for a destructive `Stop` button while `sending` is true; clicking it aborts the local fetch **and** fires `POST /threads/:id/cancel` so pi-agent-core's stuck instance is dropped server-side.
+  - Switching threads mid-stream auto-cancels the previous one (`useEffect` on `activeId` watching `prevActiveRef`).
+  - Closing the tab mid-stream fires `POST /threads/:id/cancel` via `navigator.sendBeacon` in a `beforeunload` handler.
+  - `Reset` in the header calls `stopStreamLocal()` **then** `POST /reset`; both server routes now rebuild the Agent, so this is the escape hatch when a thread is jammed.
+- **Responsive layout**:
+  - Desktop (`≥ md`, 768px+): sidebar is inline `static`, always visible, 240px wide.
+  - Mobile (`< md`): sidebar becomes a fixed drawer that slides in via `translate-x-{0,-full}` with a `backdrop-blur` overlay. Header shows a hamburger `☰` (`md:hidden`) that flips `sidebarOpen`. Picking a thread or tapping the backdrop closes the drawer.
+  - The `Reset` button hides its label on `< sm` (`hidden sm:inline`) so the header stays tight on phones.
+  - Do not swap this pattern for a runtime device detector; media-query classes are enough.
+- **File & image attachment limits** in `web-next/src/components/composer.tsx` must match `src/server.ts` constants (`MAX_IMAGES=6`, `MAX_IMAGE_BYTES=5MB`, `MAX_FILES=10`, `MAX_FILE_BYTES=200KB`, `ALLOWED_IMAGE_MIMES`). Client-side check is for UX, not security.
+- **No file upload API besides base64-in-JSON.** No multipart, no service worker, no PWA manifest, no offline mode.
+- **Build & deploy**:
+  1. Local: `cd web-next && npm ci && npm run build` (~5s cold).
+  2. Copy output: `rm -rf src/web-next && mkdir -p src/web-next && cp -R web-next/out/. src/web-next/`.
+  3. Deploy: sync `src/web-next/` to NAS along with `src/server.ts`; rebuild container.
+- **Do not check in `src/web-next/`** — `.gitignore` excludes it. It is a build artifact.
 
 ---
 
@@ -282,7 +324,7 @@ Renaming / restructuring:
 
 - Repo: `github.com/pump30/pi-dyland` (public). Working branch during active dev: `vk/5811-init-the-persona`. `main` intentionally lags — merge only when the owner asks.
 - Commit style: `<type>: <one-line summary>` where type ∈ `feat, fix, chore, docs, refactor`. Body wrapped at ~72 cols. Focus on **why**.
-- Stage explicit paths (`git add src/server.ts src/web/app.js`). **Never `git add -A` or `git add .`.**
+- Stage explicit paths (`git add src/server.ts web-next/src/components/chat-app.tsx`). **Never `git add -A` or `git add .`.**
 - Never commit `.env`, `node_modules/`, `dist/`.
 - Never bypass hooks (`--no-verify`), never `--amend` a pushed commit.
 - Only commit when the owner explicitly asks or when a stop-hook demands it. Pushing to `origin` counts as an external action — do not push unprompted.

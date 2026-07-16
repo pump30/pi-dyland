@@ -6,6 +6,7 @@ import {
 	type SimpleStreamOptions,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { buildMemoryContext, rememberTool } from "./memory.ts";
 
 // -----------------------------------------------------------------------------
 // LLM backend: SAP AI Core proxy (aicore-proxy) on my NAS, Anthropic-compatible.
@@ -81,15 +82,17 @@ Ground rules:
 - Use the tools available to you when a request naturally maps to one. Prefer one focused tool call over speculating.
 - If a task cannot be done with the available tools, say so plainly instead of pretending.
 - When a tool errors, surface the error message and stop; do not retry blindly.
-- Do not fabricate data (calendar events, credentials, files). Verify via a tool call first.`;
+- Do not fabricate data (calendar events, credentials, files). Verify via a tool call first.
+- Use the "remember" tool sparingly. Only save stable facts the user explicitly stated (timezone, preferred language, employer, common recipients). Never store secrets, credentials, or one-off information.`;
 
 export function createPersonalAgent(options: CreateAgentOptions): Agent {
 	const model = buildAicoreModel(options.aicore);
+	const systemPrompt = (options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + buildMemoryContext();
 	const agent = new Agent({
 		initialState: {
-			systemPrompt: options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
+			systemPrompt,
 			model,
-			tools: options.tools,
+			tools: [rememberTool, ...options.tools],
 		},
 		streamFn: buildAicoreStreamFn(options.aicore.apiKey),
 	});
