@@ -1,3 +1,5 @@
+import type { CardBlock, CardKind, CardPayload } from "./cards";
+
 export interface Thread {
   id: string;
   title: string;
@@ -36,6 +38,7 @@ export interface AttachmentFile {
   name: string;
   content: string;
   size: number;
+  addToLibrary?: boolean;
 }
 
 /** Message rendered in the chat log (client-side model, not pi's raw shape). */
@@ -56,6 +59,8 @@ export type ChatMessage =
       thinking?: string;
       /** true while streaming; false once done. */
       streaming?: boolean;
+      /** Cards attached to this assistant turn (transient — not persisted). */
+      cards?: CardBlock[];
     }
   | {
       id: string;
@@ -102,5 +107,12 @@ export type SseEvent =
       totalOutput: number;
     }
   | { type: "goal_updated"; goal: SessionGoal | null }
+  | {
+      type: "card";
+      id: string;
+      parent: string | null;
+      kind: CardKind;
+      payload: CardPayload;
+    }
   | { type: "error"; message: string }
   | { type: "done" };

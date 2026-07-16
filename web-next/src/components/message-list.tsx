@@ -7,6 +7,7 @@ import { MarkdownBody } from "./markdown";
 import { ToolCard } from "./tool-card";
 import { ReasoningPanel } from "./reasoning-panel";
 import { FeedbackButtons } from "./feedback-buttons";
+import { CardRenderer } from "./cards/card-renderer";
 
 export function MessageList({
   messages,
@@ -87,6 +88,13 @@ function MessageRow({ msg, threadId }: { msg: ChatMessage; threadId: string }) {
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-muted-foreground" />
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-muted-foreground [animation-delay:150ms]" />
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-muted-foreground [animation-delay:300ms]" />
+                </div>
+              )}
+              {msg.cards && msg.cards.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  {msg.cards.map((c) => (
+                    <CardRenderer key={c.id} kind={c.kind} payload={c.payload} />
+                  ))}
                 </div>
               )}
               {/* Feedback appears only after streaming completes, and only

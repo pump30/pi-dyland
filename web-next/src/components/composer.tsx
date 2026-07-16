@@ -65,6 +65,7 @@ export const Composer = forwardRef<ComposerHandle, {
     prompt: string,
     images: AttachmentImage[],
     files: AttachmentFile[],
+    opts: { addToLibrary: boolean },
   ) => void;
   onStop: () => void;
   onError: (msg: string) => void;
@@ -80,6 +81,7 @@ export const Composer = forwardRef<ComposerHandle, {
   const [images, setImages] = useState<AttachmentImage[]>([]);
   const [files, setFiles] = useState<AttachmentFile[]>([]);
   const [slashHl, setSlashHl] = useState(0);
+  const [addToLibrary, setAddToLibrary] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -168,10 +170,11 @@ export const Composer = forwardRef<ComposerHandle, {
     if (disabled) return;
     const text = value.trim();
     if (!text && images.length === 0 && files.length === 0) return;
-    onSend(text, images, files);
+    onSend(text, images, files, { addToLibrary });
     setValue("");
     setImages([]);
     setFiles([]);
+    setAddToLibrary(false);
   }
 
   return (
@@ -219,6 +222,17 @@ export const Composer = forwardRef<ComposerHandle, {
             </span>
           ))}
         </div>
+      )}
+      {files.length > 0 && (
+        <label className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            className="h-3 w-3 rounded border-border/70 accent-primary"
+            checked={addToLibrary}
+            onChange={(e) => setAddToLibrary(e.target.checked)}
+          />
+          加入文件库 <span className="text-muted-foreground/70">(可通过 /library 管理，200KB 内)</span>
+        </label>
       )}
       <div className="relative">
         {slashOptions.length > 0 && (

@@ -83,7 +83,9 @@ Ground rules:
 - If a task cannot be done with the available tools, say so plainly instead of pretending.
 - When a tool errors, surface the error message and stop; do not retry blindly.
 - Do not fabricate data (calendar events, credentials, files). Verify via a tool call first.
-- Use the "remember" tool sparingly. Only save stable facts the user explicitly stated (timezone, preferred language, employer, common recipients). Never store secrets, credentials, or one-off information.`;
+- Use the "remember" tool sparingly. Only save stable facts the user explicitly stated (timezone, preferred language, employer, common recipients). Never store secrets, credentials, or one-off information.
+- If the user asks about their own files, notes, or documents (their "library" / "文件库" / "笔记" / "文档"), call rag_search with a focused query before answering. Never invent contents; only cite what rag_search returned.
+- When rag_search returns hits, summarize in your own words and reference the source names in prose. The UI renders per-file cards automatically — do NOT paste the raw snippet JSON back into your reply.`;
 
 export function createPersonalAgent(options: CreateAgentOptions): Agent {
 	const model = buildAicoreModel(options.aicore);

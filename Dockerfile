@@ -1,55 +1,79 @@
 # pi-dyland: personal agent HTTP service.
 #
-# Three-stage image:
-#   1. frontend — builds the Next.js static export into /web/out.
-#   2. deps     — installs backend production npm deps.
-#   3. runtime  — assembles the final image.
+# Four-stage image:
+#   1. frontend   — builds the Next.js static export into /web/out.
+#   2. deps       — installs backend production npm deps.
+#   3. modelcache — downloads the ONNX embedding model (~23 MB) so the runtime
+#                   is fully offline. Uses transformers.js cache dir convention.
+#   4. runtime    — assembles the final image.
+#
 # The runtime uses Node 22 with the native TypeScript stripper
 # (--experimental-strip-types) so we don't need to precompile the backend.
+
 FROM node:22-bookworm-slim AS frontend
 WORKDIR /web
-# Install deps first so the layer cache survives source edits.
 COPY web-next/package.json ./
 RUN npm install --ignore-scripts
 COPY web-next/ ./
-# next.config.ts sets `output: "export"` → produces /web/out
 RUN npm run build
 
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
+# Native modules (better-sqlite3, onnxruntime-node) need build tools when
+# prebuilds are missing. Install once here, dropped from the runtime image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential python3 pkg-config \
+ && rm -rf /var/lib/apt/lists/*
 COPY package.json ./
-RUN npm install --omit=dev --ignore-scripts
+# postinstall scripts are ALLOWED here. onnxruntime-node's prebuild download
+# and better-sqlite3's node-gyp fallback both live in postinstall. See
+# CLAUDE.md §15.1 exception for pi-local-rag deps.
+RUN npm install --omit=dev
+
+FROM node:22-bookworm-slim AS modelcache
+WORKDIR /work
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+# Warm the transformers.js cache. HuggingFace pulls ~23 MB into
+# ~/.cache/huggingface/. We move it to a stable location so the runtime
+# stage can COPY --from=modelcache and be network-independent.
+ENV TRANSFORMERS_CACHE=/root/.cache/huggingface \
+    HF_HOME=/root/.cache/huggingface
+RUN node --experimental-strip-types --no-warnings -e "\
+  const {pipeline} = await import('@xenova/transformers');\
+  await pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2');\
+  console.log('embedder cached');\
+"
 
 FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 
-# Shell-skill runtime deps: curl (SMTP + HTTP), jq (JSON parsing in bash),
-# python3 (used by nas-calendar for date arithmetic), ca-certificates (TLS).
+# Shell-skill runtime deps + libs required by native modules at runtime.
+# libstdc++6 covers better-sqlite3 and onnxruntime-node.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl jq python3 ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      curl jq python3 ca-certificates libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules ./node_modules
+COPY --from=modelcache /root/.cache/huggingface /root/.cache/huggingface
 COPY package.json tsconfig.json ./
 COPY src ./src
 COPY skills ./skills
-# Frontend static export — server.ts serves this from /app/src/web-next.
 COPY --from=frontend /web/out ./src/web-next
 
-# Make skill scripts executable (bind-mounted skills also work at runtime).
 RUN find ./skills -type f -name 'run.sh' -exec chmod +x {} +
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8787 \
     SKILLS_PATH=/app/skills \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    TRANSFORMERS_CACHE=/root/.cache/huggingface \
+    HF_HOME=/root/.cache/huggingface \
+    TRANSFORMERS_OFFLINE=1
 
-# Durable JSON state (user profile, preferences) lives here. Bind-mount a host
-# path over /data at `docker run` time so memory survives container recreation.
 VOLUME ["/data"]
-
 EXPOSE 8787
-
-# Use Node's native TS support so we don't need a build step.
 CMD ["node", "--experimental-strip-types", "--no-warnings", "src/server.ts"]

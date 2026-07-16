@@ -13,6 +13,21 @@ import { fileURLToPath } from "node:url";
 import { createPersonalAgent, oneShotCompletion } from "./agent-factory.ts";
 import { loadSkills } from "./skill-loader.ts";
 import { initMemory } from "./memory.ts";
+import {
+	initRag,
+	subscribeRag,
+	enqueueIngest,
+	listDocs,
+	deleteDoc,
+	query as ragQuery,
+	RAG_MAX_UPLOAD_BYTES,
+	RAG_MAX_UPLOAD_FILES,
+	RAG_ALLOWED_MIMES,
+	RAG_SEARCH_MAX_LIMIT,
+	RAG_SEARCH_DEFAULT_LIMIT,
+	type RagEvent,
+} from "./rag.ts";
+import { startInboxScanner } from "./rag-inbox.ts";
 
 // -----------------------------------------------------------------------------
 // Config from env
@@ -37,6 +52,10 @@ const PROGRESSIVE_SKILLS = /^(1|true|yes)$/i.test(process.env.SKILLS_PROGRESSIVE
 // Cap on goal-driven auto-continuations per thread (DeerFlow's is 8; we're a
 // single-user helper so 5 is plenty and keeps runaway loops cheap).
 const GOAL_MAX_CONTINUATIONS = 5;
+// Shared secret for skills to hit /rag/search over loopback without Basic
+// Auth. See §4.4 of RAG_SPEC.md. Empty ⇒ rag_search skill will fail; not
+// a hard error because skills without SKILL_INTERNAL_TOKEN are still fine.
+const SKILL_INTERNAL_TOKEN = process.env.SKILL_INTERNAL_TOKEN ?? "";
 
 if (!AICORE_TOKEN) {
 	console.error("[server] AICORE_TOKEN is not set. The agent cannot call the LLM backend.");
@@ -50,12 +69,19 @@ if (!authEnabled) {
 			"Set both in .env to enable Basic Auth for everything except /health.",
 	);
 }
+if (!SKILL_INTERNAL_TOKEN) {
+	console.warn(
+		"[server] WARNING: SKILL_INTERNAL_TOKEN not set. rag_search skill will fail.",
+	);
+}
 
 // -----------------------------------------------------------------------------
 // Load skills; build per-thread agents lazily.
 // -----------------------------------------------------------------------------
 
 await initMemory(DATA_DIR);
+await initRag(DATA_DIR);
+startInboxScanner();
 
 const skills = await loadSkills({ roots: SKILLS_PATH, claudeSkillRoots: CLAUDE_SKILLS_PATH });
 console.log(`[server] loaded ${skills.length} skill(s): ${skills.map((s) => s.manifest.name).join(", ") || "(none)"}`);
@@ -220,6 +246,19 @@ app.use("*", async (c, next) => {
 if (authEnabled) {
 	app.use("*", async (c, next) => {
 		if (c.req.path === "/health") return next();
+		// Loopback-only skill auth: /rag/search accepts X-Skill-Token from a
+		// process on 127.0.0.1 (i.e. our own skills). This bypasses Basic Auth
+		// so skill subprocesses don't need the human password.
+		if (c.req.path === "/rag/search" && SKILL_INTERNAL_TOKEN) {
+			const tok = c.req.header("x-skill-token");
+			const forwarded = c.req.header("x-forwarded-for");
+			const remote = (c.env as { incoming?: { socket?: { remoteAddress?: string } } })
+				?.incoming?.socket?.remoteAddress;
+			const isLoopback =
+				!forwarded &&
+				(remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1");
+			if (tok === SKILL_INTERNAL_TOKEN && isLoopback) return next();
+		}
 		return basicAuth({ username: AUTH_USER, password: AUTH_PASS })(c, next);
 	});
 }
@@ -230,6 +269,7 @@ app.get("/health", (c) =>
 		aicore: { baseUrl: AICORE_BASE_URL, model: AICORE_MODEL },
 		skills: skills.map((s) => ({ name: s.manifest.name, label: s.manifest.label })),
 		threads: threads.size,
+		rag: { docs: listDocs().length },
 	}),
 );
 
@@ -350,6 +390,7 @@ const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "im
 interface ChatFile {
 	name: string;
 	content: string;
+	addToLibrary?: boolean;
 }
 
 interface ChatBody {
@@ -403,7 +444,12 @@ function parseAttachments(body: ChatBody): ValidatedAttachments | { error: strin
 			}
 			// Sanitize file name: no newlines, no closing brackets to keep the wrapper unambiguous.
 			const safeName = rec.name.replace(/[\r\n<>]/g, "").slice(0, 200);
-			files.push({ name: safeName, content: rec.content });
+			const addFlag = (rec as { addToLibrary?: unknown }).addToLibrary;
+			files.push({
+				name: safeName,
+				content: rec.content,
+				addToLibrary: addFlag === true,
+			});
 		}
 	}
 
@@ -418,6 +464,18 @@ function buildPromptText(prompt: string, files: ChatFile[]): string {
 	}
 	parts.push(prompt);
 	return parts.join("\n\n");
+}
+
+function guessMimeFromName(name: string): string {
+	const lower = name.toLowerCase();
+	const dot = lower.lastIndexOf(".");
+	if (dot < 0) return "text/plain";
+	const ext = lower.slice(dot);
+	if (ext === ".md" || ext === ".markdown") return "text/markdown";
+	if (ext === ".json") return "application/json";
+	if (ext === ".csv") return "text/csv";
+	if (ext === ".html" || ext === ".htm") return "text/html";
+	return "text/plain";
 }
 
 // Slash-trigger: `/skill_name rest of prompt` prepends a soft directive so the
@@ -701,6 +759,117 @@ async function evaluateGoalContinuation(
 	return { action: "stop", reason: `evaluator ${verdict}` };
 }
 
+// -----------------------------------------------------------------------------
+// RAG — knowledge base routes
+// -----------------------------------------------------------------------------
+
+const RAG_UPLOAD_BODY_MAX = 110 * 1024 * 1024; // 110MB body cap (5×20MB × 1.33 base64 + overhead)
+
+interface RagUploadFile {
+	name?: unknown;
+	mime?: unknown;
+	bytesBase64?: unknown;
+}
+interface RagUploadBody {
+	files?: unknown;
+}
+
+app.post("/rag/upload", async (c) => {
+	const cl = Number(c.req.header("content-length") ?? "0");
+	if (cl > RAG_UPLOAD_BODY_MAX) {
+		return c.json({ error: `body too large (max ${RAG_UPLOAD_BODY_MAX} bytes)` }, 413);
+	}
+	const body = (await c.req.json().catch(() => ({}))) as RagUploadBody;
+	if (!Array.isArray(body.files)) return c.json({ error: "files[] required" }, 400);
+	if (body.files.length === 0) return c.json({ error: "no files" }, 400);
+	if (body.files.length > RAG_MAX_UPLOAD_FILES) {
+		return c.json({ error: `too many files (max ${RAG_MAX_UPLOAD_FILES})` }, 400);
+	}
+	const jobsOut: Array<{ id: string; name: string }> = [];
+	for (const [i, raw] of body.files.entries()) {
+		if (!raw || typeof raw !== "object") {
+			return c.json({ error: `files[${i}] must be an object` }, 400);
+		}
+		const f = raw as RagUploadFile;
+		if (
+			typeof f.name !== "string" ||
+			typeof f.mime !== "string" ||
+			typeof f.bytesBase64 !== "string"
+		) {
+			return c.json({ error: `files[${i}] needs {name,mime,bytesBase64}` }, 400);
+		}
+		if (!RAG_ALLOWED_MIMES.has(f.mime)) {
+			return c.json({ error: `files[${i}] mime ${f.mime} not allowed` }, 400);
+		}
+		let bytes: Buffer;
+		try {
+			bytes = Buffer.from(f.bytesBase64, "base64");
+		} catch {
+			return c.json({ error: `files[${i}] invalid base64` }, 400);
+		}
+		if (bytes.length > RAG_MAX_UPLOAD_BYTES) {
+			return c.json({ error: `files[${i}] exceeds ${RAG_MAX_UPLOAD_BYTES} bytes` }, 400);
+		}
+		const job = enqueueIngest({ name: f.name, mime: f.mime, bytes, source: "upload" });
+		jobsOut.push({ id: job.id, name: job.name });
+	}
+	return c.json({ jobs: jobsOut }, 202);
+});
+
+app.get("/rag/docs", (c) => c.json({ docs: listDocs() }));
+
+app.delete("/rag/docs/:sha", async (c) => {
+	const sha = c.req.param("sha");
+	const ok = await deleteDoc(sha);
+	if (!ok) return c.json({ error: "not found" }, 404);
+	return c.json({ ok: true });
+});
+
+interface RagSearchBody {
+	query?: unknown;
+	limit?: unknown;
+}
+app.post("/rag/search", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) as RagSearchBody;
+	if (typeof body.query !== "string" || !body.query.trim()) {
+		return c.json({ error: "query required" }, 400);
+	}
+	const limit =
+		typeof body.limit === "number" && Number.isFinite(body.limit)
+			? Math.max(1, Math.min(RAG_SEARCH_MAX_LIMIT, Math.floor(body.limit)))
+			: RAG_SEARCH_DEFAULT_LIMIT;
+	const hits = await ragQuery(body.query.trim(), limit);
+	return c.json({ hits });
+});
+
+// SSE stream for job & doc lifecycle. Same discipline as /chat:
+//   - ": ready\n\n" upfront to defeat Cloudflare 524.
+//   - 15s heartbeat.
+//   - unsubscribe in finally.
+app.get("/rag/events", (c) => {
+	return streamSSE(c, async (stream) => {
+		await stream.write(": ready\n\n").catch(() => {});
+		const heartbeat = setInterval(() => {
+			stream.write(`: heartbeat ${Date.now()}\n\n`).catch(() => {});
+		}, HEARTBEAT_MS);
+		const unsub = subscribeRag(async (ev: RagEvent) => {
+			try {
+				await stream.writeSSE({ data: JSON.stringify(ev) });
+			} catch {
+				/* stream closed */
+			}
+		});
+		try {
+			await new Promise<void>((resolve) => {
+				stream.onAbort(() => resolve());
+			});
+		} finally {
+			clearInterval(heartbeat);
+			unsub();
+		}
+	});
+});
+
 app.post("/chat", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as ChatBody;
 	const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -779,6 +948,22 @@ app.post("/chat", async (c) => {
 	const goalHint = entry.goal
 		? `${SYSTEM_HINT_OPEN}Session goal (active): ${entry.goal.text}${SYSTEM_HINT_CLOSE}\n\n`
 		: "";
+	// Fan-out chat-side ingest: any attachment flagged addToLibrary is copied
+	// into the RAG queue. The attachment cap (200KB) has already been enforced
+	// in parseAttachments; we just need the bytes.
+	for (const f of parsed.files) {
+		if (!f.addToLibrary) continue;
+		try {
+			enqueueIngest({
+				name: f.name,
+				mime: guessMimeFromName(f.name),
+				bytes: Buffer.from(f.content, "utf8"),
+				source: "chat",
+			});
+		} catch (err) {
+			console.warn("[chat] add-to-library failed:", err);
+		}
+	}
 	const promptText = goalHint + buildPromptText(effectivePrompt, parsed.files);
 	const images = parsed.images;
 	// Rough token estimate for input: 4 chars ≈ 1 token. Cheap and good
@@ -826,14 +1011,38 @@ app.post("/chat", async (c) => {
 				case "tool_execution_start":
 					await send({ type: "tool_start", toolCallId: event.toolCallId, name: event.toolName, args: event.args });
 					break;
-				case "tool_execution_end":
+				case "tool_execution_end": {
 					await send({
 						type: "tool_end",
 						toolCallId: event.toolCallId,
 						name: event.toolName,
 						result: event.result,
 					});
+					// Extract card blocks from the skill result. skill-loader.ts
+					// strips them from LLM-visible content and stashes them on
+					// details.card_blocks; forward each one as its own SSE
+					// `card` event. Cards do NOT re-enter LLM context.
+					const details = (event.result as { details?: { card_blocks?: unknown } })
+						?.details;
+					const cardBlocks = details?.card_blocks;
+					if (Array.isArray(cardBlocks)) {
+						for (const block of cardBlocks) {
+							if (block && typeof block === "object") {
+								const card = block as { kind?: string; payload?: unknown };
+								if (typeof card.kind === "string") {
+									await send({
+										type: "card",
+										id: `card-${randomUUID()}`,
+										parent: event.toolCallId,
+										kind: card.kind,
+										payload: card.payload ?? {},
+									});
+								}
+							}
+						}
+					}
 					break;
+				}
 				// Note: agent_end is intentionally NOT forwarded. We may fire
 				// a second agent.prompt for goal continuation, and we only
 				// want the client to see one `done` at the very end. Final

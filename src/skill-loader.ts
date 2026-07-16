@@ -310,6 +310,10 @@ export async function loadSkills(options: LoadSkillsOptions): Promise<LoadedSkil
 					}
 					// Convention: run.sh writes plain text to stdout. If it writes JSON with
 					// a top-level "content" array of {type:"text",text:string}, we use that.
+					// Skill stdout may also include {type:"card", kind, payload} blocks; we
+					// filter them out of the LLM-visible content and stash them on
+					// details.card_blocks so the server can forward them to the UI without
+					// letting the LLM see raw payload JSON.
 					const text = outcome.stdout;
 					let details: unknown = { stderr: outcome.stderr };
 					let contentBlocks: AgentToolResult<unknown>["content"];
@@ -320,9 +324,18 @@ export async function loadSkills(options: LoadSkillsOptions): Promise<LoadedSkil
 							typeof parsed === "object" &&
 							Array.isArray((parsed as { content?: unknown }).content)
 						) {
-							contentBlocks = (parsed as { content: AgentToolResult<unknown>["content"] }).content;
+							const rawContent = (parsed as { content: Array<{ type?: string }> }).content;
+							const llmBlocks = rawContent.filter(
+								(b) => b && typeof b === "object" && b.type !== "card",
+							);
+							contentBlocks = llmBlocks as AgentToolResult<unknown>["content"];
+							const cardBlocks = rawContent.filter(
+								(b) => b && typeof b === "object" && b.type === "card",
+							);
 							if ((parsed as { details?: unknown }).details !== undefined) {
 								details = (parsed as { details: unknown }).details;
+							} else if (cardBlocks.length > 0) {
+								details = { stderr: outcome.stderr, card_blocks: cardBlocks };
 							}
 						} else {
 							contentBlocks = [{ type: "text", text }];
