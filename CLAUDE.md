@@ -147,13 +147,14 @@ Existing routes are the complete API. Do **not** add REST-y CRUD or "future-proo
 |---|---|---|
 | `/health` | GET | Public. Returns `{ok, aicore:{baseUrl, model}, skills:[{name,label}], threads}`. Never require auth. Never add PII. |
 | `/skills` | GET | Auth. Returns manifest array (name, label, description, parameters). Read-only. |
-| `/threads` | GET | Auth. Returns `[{id, title, createdAt, lastActiveAt, messageCount}]` sorted by `lastActiveAt` desc. |
+| `/threads` | GET | Auth. Returns `[{id, title, createdAt, lastActiveAt, messageCount, inFlight}]` sorted by `lastActiveAt` desc. |
 | `/threads` | POST | Auth. Body `{title?}`. Creates a new thread (UUID id), returns the entry. |
 | `/threads/:id` | PATCH | Auth. Body `{title?}`. Renames. 404 if unknown. |
 | `/threads/:id` | DELETE | Auth. Deletes non-default thread; returns 400 for `default`. |
+| `/threads/:id/cancel` | POST | Auth. Rebuilds the thread's Agent instance, dropping any in-flight prompt. Returns `{ok, action, wasInFlight}`. Safe no-op if the thread has no Agent yet. DeerFlow-equivalent of LangGraph's `runs/:run_id/cancel`. |
 | `/messages` | GET | Auth. Full transcript of the thread selected via `?thread=<id>` or `X-Thread-Id` header. Defaults to `default`. Read-only. |
-| `/reset` | POST | Auth. Calls `agent.reset()` on the selected thread. No body. Idempotent. |
-| `/chat` | POST | Auth. Body: `{prompt?, images?, files?, threadId?}` (threadId defaults to `default`, also honors `?thread=`/`X-Thread-Id`). Response: SSE. Server may auto-derive the thread title from the first user prompt. |
+| `/reset` | POST | Auth. **Rebuilds** the thread's Agent (drops messages + any stuck run). Returns `{ok, action}`. Idempotent. |
+| `/chat` | POST | Auth. Body: `{prompt?, images?, files?, threadId?}` (threadId defaults to `default`, also honors `?thread=`/`X-Thread-Id`). Response: SSE. Returns **409 "thread busy"** if the thread already has a prompt streaming — client must wait or hit `/threads/:id/cancel`. Server may auto-derive the thread title from the first user prompt. |
 | `/` | GET | Auth. Serves `src/web-next/index.html` (Next.js static export). |
 | `/*` | GET | Auth. Static file server rooted at `src/web-next/` for `_next/static/…` and other Next assets. Falls through to 404 for unknown paths. |
 
@@ -175,11 +176,13 @@ Rules:
 
 - The agent is **per-thread**. `server.ts` maintains `Map<threadId, Agent>` (bounded by `MAX_THREADS=50`, LRU-evicted; `default` thread is never evicted). Legacy single-thread callers (old UI, curl without `?thread=`) implicitly use the `default` thread. Do NOT per-request the agent — a thread's agent lives for the lifetime of the thread. Model config, tools, and system prompt are shared across all threads.
 - Thread IDs must match `^[a-zA-Z0-9_-]{1,64}$` or the literal `default`; invalid IDs are silently rewritten to `default` in `threadIdFrom()`. This is the boundary check for URL/header input.
+- **Cancel / stuck-agent recovery**: pi-agent-core has no public API to interrupt an in-flight `agent.prompt()`. `POST /threads/:id/cancel` and `POST /reset` both call `rebuildAgent()`, which **swaps `entry.agent` for a fresh instance and drops the stuck one**. The abandoned Agent's promise keeps running in the background (with its subscription already unsubscribed, so nothing is emitted), and pi-agent-core garbage-collects it. This is the DeerFlow-equivalent of "start a fresh run" — do NOT try to reach into pi-agent-core internals to abort the old prompt.
+- **`inFlight` semantics**: `ThreadEntry.inFlight` is set to `true` before `agent.prompt()` and cleared in `finally` — but only if `entry.agent === agent` (i.e., cancel/reset didn't swap the Agent while we were streaming). `POST /chat` rejects overlapping requests on the same thread with `409 "thread busy"` before pi-agent-core can throw its cryptic "already processing" error.
 - Model configuration is fixed to `api: "anthropic-messages"`, `provider: "superdyland"`, `baseUrl` from `AICORE_BASE_URL`. `contextWindow: 200_000`, `maxTokens: 32_000`. Do not lower.
 - **Bearer auth quirk (critical):** aicore-proxy uses `Authorization: Bearer <token>`, not `x-api-key`. pi-ai only auto-sends bearer when the token starts with `sk-ant-oat`. Our token is `sk-aicore-proxy-key` (aicore-proxy's own), so `buildAicoreStreamFn` wraps pi-ai's `streamSimple` and merges `Authorization` into `options.headers`. **Do not "clean up" this wrapper by moving auth to `Model.headers` — pi-ai's `assertRequestAuth` only inspects `options.headers`.**
 - `getApiKey` on `Agent` is not used; auth is header-injected via the wrapper. Do not reintroduce.
 - System prompt lives inline as `DEFAULT_SYSTEM_PROMPT` in `agent-factory.ts`. Keep it under 400 tokens. When editing, preserve the "Chinese with English technical terms" and "no filler" directives — they encode the owner's preference.
-- Tools passed at construction time. Adding a tool = adding a skill (see §8), not editing agent-factory.
+- Tools passed at construction time. Adding a tool = adding a skill (see §8), not editing agent-factory. The built-in `remember` tool (from `memory.ts`) is registered by `createPersonalAgent` alongside skills.
 
 ---
 
@@ -249,9 +252,21 @@ Do **not** port arbitrary Claude Code SKILL.md skills wholesale. Each port requi
 - **API is same-origin at deploy time.** Frontend calls relative paths (`/threads`, `/chat`, `/skills`, …). In `next dev` on port 3000, set `NEXT_PUBLIC_API_BASE=http://127.0.0.1:8787` (already the default when `window.location.port === "3000"`). Never bake absolute prod URLs into the bundle.
 - **Component library rules**: shadcn-style components live under `web-next/src/components/ui/`. Hand-copy new primitives (Radix + `cva`); do **not** install a design system runtime (no Ant Design, MUI, Chakra). Keep icons in `lucide-react`.
 - **Theming**: single dark theme applied via `<html class="dark">` in `layout.tsx`. CSS variables in `web-next/src/app/globals.css` under `@layer base`. Do not add a light theme unless requested.
+- **Viewport**: `<body class="h-[100dvh] overflow-hidden">` + `viewport-fit: cover` + `themeColor: "#09090b"` in `layout.tsx`. `100dvh` (not `100vh`) is required so iOS Safari's dynamic address bar does not push the composer off-screen. Do not revert to `h-screen`.
 - **State**: React state + refs. No Redux, no Zustand, no React Query unless a real need appears. `localStorage` OK for the active-thread pointer only.
 - **SSE parsing** lives in `web-next/src/lib/api.ts` (`streamChat`) and the reducer in `web-next/src/components/chat-app.tsx` (`applySseEvent`). Event union must mirror the one emitted by `src/server.ts` in `/chat`. Adding an event type requires touching both sides in the same commit.
 - **Message shape conversion** (pi Agent raw `Message[]` → client `ChatMessage[]`) lives in `web-next/src/lib/convert-messages.ts`. Handles pairing `tool_use` blocks in assistant messages with `tool_result` in the following tool message, and stripping `<system_hint>` markers.
+- **Cancel / Stop wiring** (see §7 for the server contract):
+  - `abortRef` holds the current `fetch` AbortController; `sendingThreadRef` remembers which thread is streaming (may differ from `activeId` if the user switched).
+  - The Composer swaps Send for a destructive `Stop` button while `sending` is true; clicking it aborts the local fetch **and** fires `POST /threads/:id/cancel` so pi-agent-core's stuck instance is dropped server-side.
+  - Switching threads mid-stream auto-cancels the previous one (`useEffect` on `activeId` watching `prevActiveRef`).
+  - Closing the tab mid-stream fires `POST /threads/:id/cancel` via `navigator.sendBeacon` in a `beforeunload` handler.
+  - `Reset` in the header calls `stopStreamLocal()` **then** `POST /reset`; both server routes now rebuild the Agent, so this is the escape hatch when a thread is jammed.
+- **Responsive layout**:
+  - Desktop (`≥ md`, 768px+): sidebar is inline `static`, always visible, 240px wide.
+  - Mobile (`< md`): sidebar becomes a fixed drawer that slides in via `translate-x-{0,-full}` with a `backdrop-blur` overlay. Header shows a hamburger `☰` (`md:hidden`) that flips `sidebarOpen`. Picking a thread or tapping the backdrop closes the drawer.
+  - The `Reset` button hides its label on `< sm` (`hidden sm:inline`) so the header stays tight on phones.
+  - Do not swap this pattern for a runtime device detector; media-query classes are enough.
 - **File & image attachment limits** in `web-next/src/components/composer.tsx` must match `src/server.ts` constants (`MAX_IMAGES=6`, `MAX_IMAGE_BYTES=5MB`, `MAX_FILES=10`, `MAX_FILE_BYTES=200KB`, `ALLOWED_IMAGE_MIMES`). Client-side check is for UX, not security.
 - **No file upload API besides base64-in-JSON.** No multipart, no service worker, no PWA manifest, no offline mode.
 - **Build & deploy**:
