@@ -1,0 +1,9 @@
+[Unit]
+Description=pi-dyland autodeploy (poll main and reconcile)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=15869560895
+ExecStart=/tmp/zfsv3/sata11/15869560895/data/pi-dyland/scripts/autodeploy.sh
