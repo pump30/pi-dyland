@@ -427,7 +427,7 @@ sudo docker run -d --name pi-dyland \
 - The two systemd unit files are copied to `/etc/systemd/system/`.
 - SMTP notification credentials live at `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy-notify.env` (§11.6).
 - Log: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy.log`.
-- Status: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy.status` (one line: `ok@<sha>` / `build_failed@<sha>` / `unhealthy@<sha>` / etc).
+- Status: `/tmp/zfsv3/sata11/15869560895/data/pi-dyland-data/autodeploy.status` (one line: `ok@<sha>` / `build_failed@<sha>` / `unhealthy@<sha>` / etc). **Known limitation:** the status file is only rewritten on ticks that actually restart or rebuild the container — a series of no-op ticks (e.g. only `skills/*/run.sh` or docs changed) leaves the file pinned to the last mutating deploy's SHA. `autodeploy.log` is the source of truth for "is autodeploy currently running?"; treat `autodeploy.status` as "last mutating outcome".
 - Lock: `.../pi-dyland-data/autodeploy.lock` — `flock` prevents overlapping ticks during a slow build.
 
 **Action classification** (must stay in sync with `autodeploy.sh`'s case block):
