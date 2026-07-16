@@ -16,12 +16,21 @@
     "@earendil-works/pi-ai": "0.80.7",
     "@hono/node-server": "1.19.7",
     "hono": "4.11.6",
-    "typebox": "1.1.38"
+    "typebox": "1.1.38",
+    "pi-local-rag": "0.4.1",
+    "@xenova/transformers": "2.17.2",
+    "better-sqlite3": "12.10.0",
+    "sqlite-vec": "0.1.9",
+    "pdf-parse": "1.1.1",
+    "mammoth": "1.8.0",
+    "turndown": "7.2.4",
+    "ignore": "7.0.5"
   },
   "devDependencies": {
     "@types/node": "22.19.19",
     "tsx": "4.22.1",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "@types/better-sqlite3": "7.6.11"
   },
   "engines": {
     "node": ">=22.19.0"

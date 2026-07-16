@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Download, Menu, RotateCcw, Target } from "lucide-react";
+import Link from "next/link";
+import { Download, Library, Menu, RotateCcw, Target } from "lucide-react";
 import * as api from "@/lib/api";
 import { convertRawMessages } from "@/lib/convert-messages";
 import { downloadMarkdown, exportThreadToMarkdown } from "@/lib/thread-export";
@@ -257,6 +258,7 @@ export function ChatApp() {
     prompt: string,
     images: AttachmentImage[],
     files: AttachmentFile[],
+    opts: { addToLibrary: boolean } = { addToLibrary: false },
   ) {
     if (sending) return;
     // Handle client-side slash commands that don't need a stream at all.
@@ -301,7 +303,14 @@ export function ChatApp() {
           prompt,
           threadId: targetThreadId,
           images: images.length > 0 ? images.map((i) => ({ data: i.data, mimeType: i.mimeType })) : undefined,
-          files: files.length > 0 ? files.map((f) => ({ name: f.name, content: f.content })) : undefined,
+          files:
+            files.length > 0
+              ? files.map((f) => ({
+                  name: f.name,
+                  content: f.content,
+                  addToLibrary: opts.addToLibrary || undefined,
+                }))
+              : undefined,
         },
         (ev: SseEvent) => {
           if (ev.type === "usage") {
@@ -502,6 +511,17 @@ export function ChatApp() {
           <Button
             variant="ghost"
             size="sm"
+            className="h-8 shrink-0 gap-1.5 px-2"
+            asChild
+            title="文件库"
+          >
+            <Link href="/library" aria-label="文件库">
+              <Library className="h-3.5 w-3.5" />
+            </Link>
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
             className="h-8 shrink-0 gap-1.5 px-2 md:px-3"
             onClick={handleReset}
           >
@@ -669,6 +689,39 @@ function applySseEvent(
           id: `e-${Date.now()}`,
           kind: "error",
           message: ev.message,
+        },
+      ];
+    }
+    case "card": {
+      // Attach card to the current in-flight assistant message. Cards are
+      // transient — they never re-enter the LLM context and are not persisted
+      // via /messages history reload.
+      const cardBlock = {
+        id: ev.id,
+        parent: ev.parent,
+        kind: ev.kind,
+        payload: ev.payload,
+      };
+      let attached = false;
+      const next = cur.map((m) => {
+        if (attached) return m;
+        if (m.id === ctx.assistantId && m.kind === "assistant") {
+          attached = true;
+          return { ...m, cards: [...(m.cards ?? []), cardBlock] };
+        }
+        return m;
+      });
+      if (attached) return next;
+      // No assistant message exists yet — create one so the card has a host.
+      ctx.setAssistantAdded(true);
+      return [
+        ...cur,
+        {
+          id: ctx.assistantId,
+          kind: "assistant",
+          text: "",
+          streaming: true,
+          cards: [cardBlock],
         },
       ];
     }

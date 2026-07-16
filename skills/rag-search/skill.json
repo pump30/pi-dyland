@@ -1,0 +1,22 @@
+{
+  "name": "rag_search",
+  "label": "Search library",
+  "description": "Search the user's personal knowledge base (uploaded documents, notes, and files they've added to their library). Use this when the user asks about the contents of their documents, notes, or files. Provide a focused natural-language query. Returns up to 10 relevant snippets with file names, line numbers, and scores. Snippets are rendered as visual cards for the user; you should summarize them in prose, not paste JSON.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural-language search query. Keep it focused — 3-15 words works best. Match the language of the user's request."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max hits to return (1-10). Default 5."
+      }
+    },
+    "required": ["query"]
+  },
+  "entry": "run.sh",
+  "env": ["SKILL_INTERNAL_TOKEN", "SKILL_INTERNAL_URL"],
+  "timeoutMs": 15000
+}

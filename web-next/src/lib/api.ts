@@ -143,7 +143,7 @@ export interface ChatRequestBody {
   prompt: string;
   threadId: string;
   images?: Pick<AttachmentImage, "data" | "mimeType">[];
-  files?: Pick<AttachmentFile, "name" | "content">[];
+  files?: Array<Pick<AttachmentFile, "name" | "content"> & { addToLibrary?: boolean }>;
 }
 
 /**
@@ -191,4 +191,141 @@ export async function streamChat(
       onEvent(payload);
     }
   }
+}
+
+// -----------------------------------------------------------------------------
+// RAG (knowledge base) helpers
+// -----------------------------------------------------------------------------
+
+export interface RagDoc {
+  sha: string;
+  name: string;
+  mime: string;
+  size: number;
+  chunks: number;
+  source: "chat" | "upload" | "inbox";
+  addedAt: number;
+}
+
+export interface RagJob {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  source: RagDoc["source"];
+  status: "queued" | "reading" | "chunking" | "embedding" | "done" | "failed";
+  pct: number;
+  sha?: string;
+  chunks?: number;
+  error?: string;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+export type RagEvent =
+  | { type: "job_queued"; job: RagJob }
+  | { type: "job_progress"; id: string; status: RagJob["status"]; pct: number }
+  | { type: "job_done"; id: string; doc: RagDoc }
+  | { type: "job_failed"; id: string; error: string }
+  | { type: "doc_deleted"; sha: string };
+
+export async function listRagDocs(): Promise<RagDoc[]> {
+  const res = await fetch(apiUrl("/rag/docs"), { credentials: "include" });
+  if (!res.ok) throw new Error(`listRagDocs ${res.status}`);
+  const data = (await res.json()) as { docs: RagDoc[] };
+  return data.docs;
+}
+
+export async function deleteRagDoc(sha: string): Promise<void> {
+  const res = await fetch(apiUrl(`/rag/docs/${encodeURIComponent(sha)}`), {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`deleteRagDoc ${res.status}`);
+}
+
+export async function uploadRagFiles(
+  files: Array<{ name: string; mime: string; bytes: ArrayBuffer }>,
+): Promise<Array<{ id: string; name: string }>> {
+  const payload = {
+    files: files.map((f) => ({
+      name: f.name,
+      mime: f.mime,
+      bytesBase64: bufferToBase64(f.bytes),
+    })),
+  };
+  const res = await fetch(apiUrl("/rag/upload"), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`uploadRagFiles ${res.status}: ${t}`);
+  }
+  const data = (await res.json()) as { jobs: Array<{ id: string; name: string }> };
+  return data.jobs;
+}
+
+function bufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    bin += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + chunkSize)) as number[],
+    );
+  }
+  return btoa(bin);
+}
+
+/**
+ * Subscribe to the /rag/events SSE stream. Uses fetch + ReadableStream so
+ * Basic Auth is picked up automatically by the browser (unlike EventSource
+ * on cross-realm setups). Returns a stop function.
+ */
+export function streamRagEvents(
+  onEvent: (ev: RagEvent) => void,
+  onError?: (err: unknown) => void,
+): () => void {
+  const ctrl = new AbortController();
+  (async () => {
+    try {
+      const res = await fetch(apiUrl("/rag/events"), {
+        credentials: "include",
+        signal: ctrl.signal,
+        headers: { Accept: "text/event-stream" },
+      });
+      if (!res.ok || !res.body) throw new Error(`streamRagEvents ${res.status}`);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("data:")) {
+              const raw = line.slice(5).trim();
+              if (!raw) continue;
+              try {
+                onEvent(JSON.parse(raw) as RagEvent);
+              } catch {
+                /* ignore malformed frames */
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as { name?: string }).name !== "AbortError" && onError) onError(err);
+    }
+  })();
+  return () => ctrl.abort();
 }
