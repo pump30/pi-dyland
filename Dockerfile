@@ -30,6 +30,18 @@ COPY package.json ./
 # and better-sqlite3's node-gyp fallback both live in postinstall. See
 # CLAUDE.md §15.1 exception for pi-local-rag deps.
 RUN npm install --omit=dev
+# pi-local-rag ships raw .ts source (main: "./index.ts"). Node 22's
+# --experimental-strip-types refuses to strip types inside node_modules.
+# Compile to .js in-place so runtime can import it normally.
+RUN npx --yes -p typescript@5.9.3 tsc \
+      --moduleResolution nodenext --module nodenext --target es2022 \
+      --esModuleInterop --skipLibCheck --noCheck \
+      --outDir node_modules/pi-local-rag \
+      --rootDir node_modules/pi-local-rag \
+      --declaration false \
+      $(find node_modules/pi-local-rag -maxdepth 1 -name '*.ts' ! -name '*.d.ts') \
+    && sed -i 's/"main": ".\/index.ts"/"main": ".\/index.js"/' node_modules/pi-local-rag/package.json \
+    && sed -i 's/".": ".\/index.ts"/".": ".\/index.js"/' node_modules/pi-local-rag/package.json
 
 FROM node:22-bookworm-slim AS modelcache
 WORKDIR /work
