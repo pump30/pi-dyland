@@ -39,15 +39,16 @@ COPY package.json ./
 # ~/.cache/huggingface/. We move it to a stable location so the runtime
 # stage can COPY --from=modelcache and be network-independent.
 ENV TRANSFORMERS_CACHE=/root/.cache/huggingface \
-    HF_HOME=/root/.cache/huggingface \
-    HF_ENDPOINT=https://hf-mirror.com
+    HF_HOME=/root/.cache/huggingface
 # Download the ONNX embedding model via hf-mirror.com (China-accessible
 # HuggingFace mirror) because the NAS cannot reach huggingface.co directly
-# (SNI-blocked). Retry up to 5 times with 30s backoff for transient failures.
-# Once cached in this layer, subsequent builds skip the download entirely.
+# (SNI-blocked). @xenova/transformers uses `env.remoteHost` (not an OS env
+# var) so we must set it in code before calling pipeline(). Retry up to 5
+# times with 30s backoff. Once cached in this layer, subsequent builds skip.
 RUN for i in 1 2 3 4 5; do \
   node --experimental-strip-types --no-warnings -e "\
-    const {pipeline} = await import('@xenova/transformers');\
+    import {env, pipeline} from '@xenova/transformers';\
+    env.remoteHost = 'https://hf-mirror.com/';\
     await pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2');\
     console.log('embedder cached');\
   " && break || { echo "attempt $i failed, retrying in 30s..."; sleep 30; }; \
