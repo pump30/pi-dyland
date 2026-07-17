@@ -39,12 +39,12 @@ COPY package.json ./
 # ~/.cache/huggingface/. We move it to a stable location so the runtime
 # stage can COPY --from=modelcache and be network-independent.
 ENV TRANSFORMERS_CACHE=/root/.cache/huggingface \
-    HF_HOME=/root/.cache/huggingface
-# Download the ONNX embedding model. NAS outbound is flaky so we retry up to
-# 5 times with a 30s backoff. Once cached in this layer, subsequent builds
-# skip the download entirely (Docker layer cache). The trailing `test -d`
-# ensures the build fails explicitly if all retries exhausted (for loop exits
-# 0 even when the last iteration fails).
+    HF_HOME=/root/.cache/huggingface \
+    HF_ENDPOINT=https://hf-mirror.com
+# Download the ONNX embedding model via hf-mirror.com (China-accessible
+# HuggingFace mirror) because the NAS cannot reach huggingface.co directly
+# (SNI-blocked). Retry up to 5 times with 30s backoff for transient failures.
+# Once cached in this layer, subsequent builds skip the download entirely.
 RUN for i in 1 2 3 4 5; do \
   node --experimental-strip-types --no-warnings -e "\
     const {pipeline} = await import('@xenova/transformers');\
