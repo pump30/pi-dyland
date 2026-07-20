@@ -119,6 +119,17 @@ export async function initRag(baseDataDir: string): Promise<void> {
 	// ragDir explicitly to openDb so we don't rely on cwd walk-up.
 	process.env.PI_RAG_DIR = ragDir;
 
+	// Configure @xenova/transformers to use the pre-cached model from the Docker
+	// build layer (/root/.cache/huggingface) and hf-mirror.com as fallback host
+	// (huggingface.co is SNI-blocked on NAS). Must be done before any embed() call.
+	try {
+		const { env } = await import("@xenova/transformers");
+		env.cacheDir = "/root/.cache/huggingface";
+		env.remoteHost = "https://hf-mirror.com/";
+	} catch {
+		// @xenova/transformers may not be importable in all test environments
+	}
+
 	db = openDb(ragDir);
 
 	db.exec(`
