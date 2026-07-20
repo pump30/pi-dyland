@@ -33,6 +33,9 @@ RUN npm install --omit=dev
 # pi-local-rag ships raw .ts source (main: "./index.ts"). Node 22's
 # --experimental-strip-types refuses to strip types inside node_modules.
 # Compile to .js in-place so runtime can import it normally.
+# NOTE: tsc does NOT rewrite import specifiers — compiled .js files still
+# contain `from "./foo.ts"`. The final sed fixes these to `.js` so Node's
+# module resolver doesn't fall back to the .ts file and trigger the error.
 RUN npx --yes -p typescript@5.9.3 tsc \
       --moduleResolution nodenext --module nodenext --target es2022 \
       --esModuleInterop --skipLibCheck --noCheck \
@@ -41,7 +44,8 @@ RUN npx --yes -p typescript@5.9.3 tsc \
       --declaration false \
       $(find node_modules/pi-local-rag -maxdepth 1 -name '*.ts' ! -name '*.d.ts') \
     && sed -i 's/"main": ".\/index.ts"/"main": ".\/index.js"/' node_modules/pi-local-rag/package.json \
-    && sed -i 's/".": ".\/index.ts"/".": ".\/index.js"/' node_modules/pi-local-rag/package.json
+    && sed -i 's/".": ".\/index.ts"/".": ".\/index.js"/' node_modules/pi-local-rag/package.json \
+    && sed -i 's/from "\.\(\/[^"]*\)\.ts"/from ".\1.js"/g' node_modules/pi-local-rag/*.js
 
 FROM node:22-bookworm-slim AS modelcache
 WORKDIR /work
