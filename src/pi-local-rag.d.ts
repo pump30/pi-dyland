@@ -73,3 +73,13 @@ declare module "pi-local-rag" {
 	): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }>;
 	export function embed(text: string): Promise<number[]>;
 }
+
+declare module "@xenova/transformers" {
+	export const env: {
+		cacheDir: string;
+		remoteHost: string;
+		localModelPath: string;
+		[key: string]: unknown;
+	};
+	export function pipeline(task: string, model: string): Promise<unknown>;
+}
